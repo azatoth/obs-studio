@@ -135,7 +135,13 @@ void gs_shader::BuildConstantBuffer()
 		case GS_SHADER_PARAM_VEC2:      size = sizeof(vec2);    break;
 		case GS_SHADER_PARAM_VEC3:      size = sizeof(float)*3; break;
 		case GS_SHADER_PARAM_VEC4:      size = sizeof(vec4);    break;
-		case GS_SHADER_PARAM_MATRIX4X4: size = sizeof(float)*4*4;
+		case GS_SHADER_PARAM_MATRIX4X4:
+			size = sizeof(float)*4*4;
+			break;
+		case GS_SHADER_PARAM_TEXTURE:
+		case GS_SHADER_PARAM_STRING:
+		case GS_SHADER_PARAM_UNKNOWN:
+			continue;
 		}
 
 		/* checks to see if this constant needs to start at a new
@@ -334,7 +340,7 @@ void gs_shader_set_int(gs_sparam_t *param, int val)
 	shader_setval_inline(param, &val, sizeof(int));
 }
 
-void gs_shader_setmatrix3(gs_sparam_t *param, const struct matrix3 *val)
+void gs_shader_set_matrix3(gs_sparam_t *param, const struct matrix3 *val)
 {
 	struct matrix4 mat;
 	matrix4_from_matrix3(&mat, val);

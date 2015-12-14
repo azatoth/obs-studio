@@ -59,8 +59,9 @@ typedef struct libfdk_encoder {
 	int packet_buffer_size;
 } libfdk_encoder_t;
 
-static const char *libfdk_getname(void)
+static const char *libfdk_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return obs_module_text("LibFDK");
 }
 
@@ -273,14 +274,10 @@ static bool libfdk_extra_data(void *data, uint8_t **extra_data, size_t *size)
 	return true;
 }
 
-static bool libfdk_audio_info(void *data, struct audio_convert_info *info)
+static void libfdk_audio_info(void *data, struct audio_convert_info *info)
 {
 	UNUSED_PARAMETER(data);
-
-	memset(info, 0, sizeof(struct audio_convert_info));
 	info->format = AUDIO_FORMAT_16BIT;
-
-	return true;
 }
 
 static size_t libfdk_frame_size(void *data)

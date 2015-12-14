@@ -48,6 +48,12 @@ static struct obs_source_info freetype2_source_info = {
 
 bool obs_module_load()
 {
+	char *config_dir = obs_module_config_path(NULL);
+	if (config_dir) {
+		os_mkdirs(config_dir);
+		bfree(config_dir);
+	}
+
 	FT_Init_FreeType(&ft2_lib);
 
 	if (ft2_lib == NULL) {
@@ -55,7 +61,8 @@ bool obs_module_load()
 		return false;
 	}
 
-	load_os_font_list();
+	if (!load_cached_os_font_list())
+		load_os_font_list();
 
 	obs_register_source(&freetype2_source_info);
 
@@ -68,9 +75,10 @@ void obs_module_unload(void)
 	FT_Done_FreeType(ft2_lib);
 }
 
-static const char *ft2_source_get_name(void)
+static const char *ft2_source_get_name(void *unused)
 {
-	return obs_module_text("Text (FreeType 2)");
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("TextFreetype2");
 }
 
 static uint32_t ft2_source_get_width(void *data)
@@ -219,6 +227,7 @@ static void ft2_video_tick(void *data, float seconds)
 			else
 				load_text_from_file(srcdata,
 					srcdata->text_file);
+			cache_glyphs(srcdata, srcdata->text);
 			set_up_vertex_buffer(srcdata);
 		}
 	}
@@ -335,6 +344,7 @@ static void ft2_source_update(void *data, obs_data_t *settings)
 		srcdata->font_name = NULL;
 		srcdata->font_style = NULL;
 		srcdata->max_h = 0;
+		vbuf_needs_update = true;
 	}
 
 	srcdata->font_name  = bstrdup(font_name);
@@ -360,28 +370,37 @@ static void ft2_source_update(void *data, obs_data_t *settings)
 
 	if (srcdata->font_face)
 		cache_standard_glyphs(srcdata);
-skip_font_load:;
+
+skip_font_load:
 	if (from_file) {
 		const char *tmp = obs_data_get_string(settings, "text_file");
-		if (!tmp || !*tmp) {
-			blog(LOG_WARNING,
-				"FT2-text: Failed to open %s for reading", tmp);
-			goto error;
+
+		if (!tmp || !*tmp || !os_file_exists(tmp)) {
+			const char *emptystr = " ";
+
+			bfree(srcdata->text);
+			srcdata->text = NULL;
+
+			os_utf8_to_wcs_ptr(emptystr, strlen(emptystr),
+					&srcdata->text);
+			blog(LOG_WARNING, "FT2-text: Failed to open %s for "
+			                  "reading", tmp);
 		}
+		else {
+			if (srcdata->text_file != NULL &&
+				strcmp(srcdata->text_file, tmp) == 0 &&
+				!vbuf_needs_update)
+				goto error;
 
-		if (srcdata->text_file != NULL &&
-		    strcmp(srcdata->text_file, tmp) == 0 &&
-		    !vbuf_needs_update)
-			goto error;
+			bfree(srcdata->text_file);
 
-		bfree(srcdata->text_file);
-
-		srcdata->text_file = bstrdup(tmp);
-		if (chat_log_mode)
-			read_from_end(srcdata, tmp);
-		else
-			load_text_from_file(srcdata, tmp);
-		srcdata->last_checked = os_gettime_ns();
+			srcdata->text_file = bstrdup(tmp);
+			if (chat_log_mode)
+				read_from_end(srcdata, tmp);
+			else
+				load_text_from_file(srcdata, tmp);
+			srcdata->last_checked = os_gettime_ns();
+		}
 	}
 	else {
 		const char *tmp = obs_data_get_string(settings, "text");

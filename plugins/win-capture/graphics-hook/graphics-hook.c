@@ -1,8 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
-#include <shlobj.h>
 #include <psapi.h>
-#include <ipc-util/pipe.h>
 #include "graphics-hook.h"
 #include "../obfuscate.h"
 #include "../funchook.h"
@@ -29,19 +27,21 @@ struct thread_data {
 	volatile bool          locked_textures[NUM_BUFFERS];
 };
 
-static ipc_pipe_client_t       pipe                            = {0};
-static HANDLE                  signal_restart                  = NULL;
-static HANDLE                  signal_stop                     = NULL;
-static HANDLE                  signal_ready                    = NULL;
-static HANDLE                  signal_exit                     = NULL;
-static HANDLE                  tex_mutexes[2]                  = {NULL, NULL};
+ipc_pipe_client_t              pipe                            = {0};
+HANDLE                         signal_restart                  = NULL;
+HANDLE                         signal_stop                     = NULL;
+HANDLE                         signal_ready                    = NULL;
+HANDLE                         signal_exit                     = NULL;
+HANDLE                         tex_mutexes[2]                  = {NULL, NULL};
 static HANDLE                  filemap_hook_info               = NULL;
 
+static HINSTANCE               dll_inst                        = NULL;
 static volatile bool           stop_loop                       = false;
 static HANDLE                  capture_thread                  = NULL;
-static char                    system_path[MAX_PATH]           = {0};
-static char                    process_name[MAX_PATH]          = {0};
-static char                    keepalive_name[64]              = {0};
+char                           system_path[MAX_PATH]           = {0};
+char                           process_name[MAX_PATH]          = {0};
+char                           keepalive_name[64]              = {0};
+HWND                           dummy_window                    = NULL;
 
 static unsigned int            shmem_id_counter                = 0;
 static void                    *shmem_info                     = NULL;
@@ -52,6 +52,7 @@ static struct thread_data      thread_data                     = {0};
 volatile bool                  active                          = false;
 struct hook_info               *global_hook_info               = NULL;
 
+
 static inline void wait_for_dll_main_finish(HANDLE thread_handle)
 {
 	if (thread_handle) {
@@ -60,10 +61,10 @@ static inline void wait_for_dll_main_finish(HANDLE thread_handle)
 	}
 }
 
-static inline bool init_pipe(void)
+bool init_pipe(void)
 {
 	char new_name[64];
-	sprintf(new_name, "%s%d", PIPE_NAME, GetCurrentProcessId());
+	sprintf(new_name, "%s%lu", PIPE_NAME, GetCurrentProcessId());
 
 	if (!ipc_pipe_client_open(&pipe, new_name)) {
 		DbgOut("Failed to open pipe\n");
@@ -86,7 +87,7 @@ static HANDLE init_mutex(const char *name, DWORD pid)
 	char new_name[64];
 	HANDLE handle;
 
-	sprintf(new_name, "%s%d", name, pid);
+	sprintf(new_name, "%s%lu", name, pid);
 
 	handle = OpenMutexA(MUTEX_ALL_ACCESS, false, new_name);
 	if (!handle)
@@ -140,10 +141,9 @@ static inline bool init_mutexes(void)
 
 static inline bool init_system_path(void)
 {
-	HRESULT hr = SHGetFolderPathA(NULL, CSIDL_SYSTEM, NULL,
-			SHGFP_TYPE_CURRENT, system_path);
-	if (hr != S_OK) {
-		hlog("Failed to get windows system path: %08lX", hr);
+	UINT ret = GetSystemDirectoryA(system_path, MAX_PATH);
+	if (!ret) {
+		hlog("Failed to get windows system path: %lu", GetLastError());
 		return false;
 	}
 
@@ -182,11 +182,60 @@ static inline bool init_hook_info(void)
 	return true;
 }
 
+#define DEF_FLAGS (WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS)
+
+static DWORD WINAPI dummy_window_thread(LPVOID *unused)
+{
+	static const wchar_t dummy_window_class[] = L"temp_d3d_window_4039785";
+	WNDCLASSW wc;
+	MSG msg;
+
+	memset(&wc, 0, sizeof(wc));
+	wc.style = CS_OWNDC;
+	wc.hInstance = dll_inst;
+	wc.lpfnWndProc = (WNDPROC)DefWindowProc;
+	wc.lpszClassName = dummy_window_class;
+
+	if (!RegisterClass(&wc)) {
+		hlog("Failed to create temp D3D window class: %lu",
+				GetLastError());
+		return 0;
+	}
+
+	dummy_window = CreateWindowExW(0, dummy_window_class, L"Temp Window",
+			DEF_FLAGS, 0, 0, 1, 1, NULL, NULL, dll_inst, NULL);
+	if (!dummy_window) {
+		hlog("Failed to create temp D3D window: %lu", GetLastError());
+		return 0;
+	}
+
+	while (GetMessage(&msg, NULL, 0, 0)) {
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	(void)unused;
+	return 0;
+}
+
+static inline void init_dummy_window_thread(void)
+{
+	HANDLE thread = CreateThread(NULL, 0, dummy_window_thread, NULL, 0,
+			NULL);
+	if (!thread) {
+		hlog("Failed to create temp D3D window thread: %lu",
+				GetLastError());
+		return;
+	}
+
+	CloseHandle(thread);
+}
+
 static inline bool init_hook(HANDLE thread_handle)
 {
 	wait_for_dll_main_finish(thread_handle);
 
-	sprintf(keepalive_name, "%s%d", EVENT_HOOK_KEEPALIVE,
+	sprintf(keepalive_name, "%s%lu", EVENT_HOOK_KEEPALIVE,
 			GetCurrentProcessId());
 
 	if (!init_pipe()) {
@@ -205,6 +254,7 @@ static inline bool init_hook(HANDLE thread_handle)
 		return false;
 	}
 
+	init_dummy_window_thread();
 	log_current_process();
 
 	SetEvent(signal_restart);
@@ -241,8 +291,7 @@ static void free_hook(void)
 
 static inline bool d3d8_hookable(void)
 {
-	return !!global_hook_info->offsets.d3d8.present &&
-		!!global_hook_info->offsets.d3d8.reset;
+	return !!global_hook_info->offsets.d3d8.present;
 }
 
 static inline bool ddraw_hookable(void)
@@ -261,9 +310,7 @@ static inline bool d3d9_hookable(void)
 {
 	return !!global_hook_info->offsets.d3d9.present &&
 		!!global_hook_info->offsets.d3d9.present_ex &&
-		!!global_hook_info->offsets.d3d9.present_swap &&
-		!!global_hook_info->offsets.d3d9.reset &&
-		!!global_hook_info->offsets.d3d9.reset_ex;
+		!!global_hook_info->offsets.d3d9.present_swap;
 }
 
 static inline bool dxgi_hookable(void)
@@ -274,7 +321,7 @@ static inline bool dxgi_hookable(void)
 
 static inline bool attempt_hook(void)
 {
-	static bool ddraw_hooked = false;
+	//static bool ddraw_hooked = false;
 	static bool d3d8_hooked  = false;
 	static bool d3d9_hooked  = false;
 	static bool dxgi_hooked  = false;
@@ -311,7 +358,7 @@ static inline bool attempt_hook(void)
 		rehook_gl();*/
 	}
 
-	/*if (!d3d8_hooked) {
+	if (!d3d8_hooked) {
 		if (!d3d8_hookable()) {
 			d3d8_hooked = true;
 		} else {
@@ -322,7 +369,7 @@ static inline bool attempt_hook(void)
 		}
 	}
 
-	if (!ddraw_hooked) {
+	/*if (!ddraw_hooked) {
 		if (!ddraw_hookable()) {
 			ddraw_hooked = true;
 		} else {
@@ -401,87 +448,6 @@ void hlog_hr(const char *text, HRESULT hr)
 	}
 }
 
-inline const char *get_process_name(void)
-{
-	return process_name;
-}
-
-inline HMODULE get_system_module(const char *module)
-{
-	char base_path[MAX_PATH];
-
-	strcpy(base_path, system_path);
-	strcat(base_path, "\\");
-	strcat(base_path, module);
-	return GetModuleHandleA(module);
-}
-
-inline HMODULE load_system_library(const char *name)
-{
-	char base_path[MAX_PATH];
-	HMODULE module;
-
-	strcpy(base_path, system_path);
-	strcat(base_path, "\\");
-	strcat(base_path, name);
-
-	module = GetModuleHandleA(base_path);
-	if (module)
-		return module;
-
-	return LoadLibraryA(base_path);
-}
-
-static inline bool capture_alive(void)
-{
-	HANDLE event = OpenEventA(EVENT_ALL_ACCESS, false, keepalive_name);
-	if (event) {
-		CloseHandle(event);
-		return true;
-	}
-
-	return false;
-}
-
-inline bool capture_active(void)
-{
-	return active;
-}
-
-static inline bool capture_stopped(void)
-{
-	return WaitForSingleObject(signal_stop, 0) == WAIT_OBJECT_0;
-}
-
-static inline bool capture_restarted(void)
-{
-	return WaitForSingleObject(signal_restart, 0) == WAIT_OBJECT_0;
-}
-
-inline bool capture_should_stop(void)
-{
-	bool stop_requested = false;
-
-	if (capture_active())
-		stop_requested = capture_stopped() || !capture_alive();
-
-	return stop_requested;
-}
-
-inline bool capture_should_init(void)
-{
-	if (!capture_active() && capture_restarted()) {
-		if (capture_alive()) {
-			if (!ipc_pipe_client_valid(&pipe)) {
-				init_pipe();
-			}
-			return true;
-		}
-	}
-
-	return false;
-}
-
 static inline uint64_t get_clockfreq(void)
 {
 	static bool have_clockfreq = false;
@@ -508,7 +474,7 @@ uint64_t os_gettime_ns(void)
 	return (uint64_t)time_val;
 }
 
-inline int try_lock_shmem_tex(int id)
+static inline int try_lock_shmem_tex(int id)
 {
 	int next = id == 0 ? 1 : 0;
 
@@ -521,38 +487,11 @@ inline int try_lock_shmem_tex(int id)
 	return -1;
 }
 
-inline void unlock_shmem_tex(int id)
+static inline void unlock_shmem_tex(int id)
 {
 	if (id != -1) {
 		ReleaseMutex(tex_mutexes[id]);
 	}
-}
-
-static inline bool frame_ready(uint64_t interval)
-{
-	static uint64_t last_time = 0;
-	uint64_t        elapsed;
-	uint64_t        t;
-
-	if (!interval) {
-		return true;
-	}
-
-	t = os_gettime_ns();
-	elapsed = t - last_time;
-
-	if (elapsed < interval) {
-		return false;
-	}
-
-	last_time = (elapsed > interval * 2) ? t : last_time + interval;
-	return true;
-}
-
-inline bool capture_ready(void)
-{
-	return capture_active() &&
-		frame_ready(global_hook_info->frame_interval);
 }
 
 static inline bool init_shared_info(size_t size)
@@ -581,7 +520,7 @@ static inline bool init_shared_info(size_t size)
 
 bool capture_init_shtex(struct shtex_data **data, HWND window,
 		uint32_t base_cx, uint32_t base_cy, uint32_t cx, uint32_t cy,
-		uint32_t format, bool flip, uint32_t handle)
+		uint32_t format, bool flip, uintptr_t handle)
 {
 	if (!init_shared_info(sizeof(struct shtex_data))) {
 		hlog("capture_init_shtex: Failed to initialize memory");
@@ -589,9 +528,9 @@ bool capture_init_shtex(struct shtex_data **data, HWND window,
 	}
 
 	*data = shmem_info;
-	(*data)->tex_handle = handle;
+	(*data)->tex_handle = (uint32_t)handle;
 
-	global_hook_info->window = (uint32_t)window;
+	global_hook_info->window = (uint32_t)(uintptr_t)window;
 	global_hook_info->type = CAPTURE_TYPE_TEXTURE;
 	global_hook_info->format = format;
 	global_hook_info->flip = flip;
@@ -675,7 +614,7 @@ finish:
 	return 0;
 }
 
-inline void shmem_copy_data(size_t idx, void *volatile data)
+void shmem_copy_data(size_t idx, void *volatile data)
 {
 	EnterCriticalSection(&thread_data.data_mutex);
 	thread_data.cur_tex = (int)idx;
@@ -686,7 +625,7 @@ inline void shmem_copy_data(size_t idx, void *volatile data)
 	SetEvent(thread_data.copy_event);
 }
 
-inline bool shmem_texture_data_lock(int idx)
+bool shmem_texture_data_lock(int idx)
 {
 	bool locked;
 	
@@ -702,7 +641,7 @@ inline bool shmem_texture_data_lock(int idx)
 	return false;
 }
 
-inline void shmem_texture_data_unlock(int idx)
+void shmem_texture_data_unlock(int idx)
 {
 	EnterCriticalSection(&thread_data.data_mutex);
 	thread_data.locked_textures[idx] = false;
@@ -781,7 +720,7 @@ bool capture_init_shmem(struct shmem_data **data, HWND window,
 	(*data)->tex1_offset = (uint32_t)align_pos;
 	(*data)->tex2_offset = (*data)->tex1_offset + aligned_tex;
 
-	global_hook_info->window = (uint32_t)window;
+	global_hook_info->window = (uint32_t)(uintptr_t)window;
 	global_hook_info->type = CAPTURE_TYPE_MEMORY;
 	global_hook_info->format = format;
 	global_hook_info->flip = flip;
@@ -850,6 +789,8 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID unused1)
 {
 	if (reason == DLL_PROCESS_ATTACH) {
 		wchar_t name[MAX_PATH];
+
+		dll_inst = hinst;
 
 		HANDLE cur_thread = OpenThread(THREAD_ALL_ACCESS, false,
 				GetCurrentThreadId());

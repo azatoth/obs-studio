@@ -198,11 +198,14 @@ static bool init_display_stream(struct display_capture *dc)
 					dc->screen.frame.size.width,
 					dc->screen.frame.size.height)));
 
+	CFBooleanRef show_cursor_cf =
+		dc->hide_cursor ? kCFBooleanFalse : kCFBooleanTrue;
+
 	NSDictionary *dict = @{
 		(__bridge NSString*)kCGDisplayStreamSourceRect: rect_dict,
 		(__bridge NSString*)kCGDisplayStreamQueueDepth: @5,
 		(__bridge NSString*)kCGDisplayStreamShowCursor:
-			@(!dc->hide_cursor),
+			(id)show_cursor_cf,
 	};
 
 	os_event_init(&dc->disp_finished, OS_EVENT_TYPE_MANUAL);
@@ -258,8 +261,9 @@ static void *display_capture_create(obs_data_t *settings,
 	struct display_capture *dc = bzalloc(sizeof(struct display_capture));
 
 	dc->source = source;
+	dc->hide_cursor = !obs_data_get_bool(settings, "show_cursor");
 
-	dc->effect = obs_get_default_rect_effect();
+	dc->effect = obs_get_base_effect(OBS_EFFECT_DEFAULT_RECT);
 	if (!dc->effect)
 		goto fail;
 
@@ -418,8 +422,9 @@ static void display_capture_video_render(void *data, gs_effect_t *effect)
 	gs_technique_end(tech);
 }
 
-static const char *display_capture_getname(void)
+static const char *display_capture_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return obs_module_text("DisplayCapture");
 }
 

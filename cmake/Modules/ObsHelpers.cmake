@@ -77,6 +77,7 @@ if(NOT UNIX_STRUCTURE)
 	endif()
 	set(OBS_CMAKE_DESTINATION "cmake")
 	set(OBS_INCLUDE_DESTINATION "include")
+	set(OBS_UNIX_STRUCTURE "0")
 else()
 	if(NOT OBS_MULTIARCH_SUFFIX AND DEFINED ENV{OBS_MULTIARCH_SUFFIX})
 		set(OBS_MULTIARCH_SUFFIX "$ENV{OBS_MULTIARCH_SUFFIX}")
@@ -98,6 +99,7 @@ else()
 	set(OBS_DATA_PATH "${OBS_DATA_DESTINATION}")
 	set(OBS_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}/")
 	set(OBS_RELATIVE_PREFIX "../")
+	set(OBS_UNIX_STRUCTURE "1")
 endif()
 
 function(obs_finish_bundle)
@@ -521,10 +523,17 @@ function(define_graphic_modules target)
 	foreach(dl_lib opengl d3d9 d3d11)
 		string(TOUPPER ${dl_lib} dl_lib_upper)
 		if(TARGET libobs-${dl_lib})
-			target_compile_definitions(${target}
-				PRIVATE
-				DL_${dl_lib_upper}="$<TARGET_FILE_NAME:libobs-${dl_lib}>"
-				)
+			if(UNIX AND UNIX_STRUCTURE)
+				target_compile_definitions(${target}
+					PRIVATE
+					DL_${dl_lib_upper}="$<TARGET_SONAME_FILE_NAME:libobs-${dl_lib}>"
+					)
+			else()
+				target_compile_definitions(${target}
+					PRIVATE
+					DL_${dl_lib_upper}="$<TARGET_FILE_NAME:libobs-${dl_lib}>"
+					)
+			endif()
 		else()
 			target_compile_definitions(${target}
 				PRIVATE

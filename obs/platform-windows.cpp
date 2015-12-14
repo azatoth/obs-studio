@@ -22,12 +22,14 @@
 #include "platform.hpp"
 using namespace std;
 
+#include <util/windows/win-version.h>
 #include <util/platform.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <Dwmapi.h>
 
 static inline bool check_path(const char* data, const char *path,
 		string &output)
@@ -158,4 +160,45 @@ vector<string> GetPreferredLocales()
 	}
 
 	return result;
+}
+
+uint32_t GetWindowsVersion()
+{
+	static uint32_t ver = 0;
+
+	if (ver == 0) {
+		struct win_version_info ver_info;
+
+		get_win_ver(&ver_info);
+		ver = (ver_info.major << 8) | ver_info.minor;
+	}
+
+	return ver;
+}
+
+void SetAeroEnabled(bool enable)
+{
+	static HRESULT (WINAPI *func)(UINT) = nullptr;
+	static bool failed = false;
+
+	if (!func) {
+		if (failed) {
+			return;
+		}
+
+		HMODULE dwm = LoadLibraryW(L"dwmapi");
+		if (!dwm) {
+			failed = true;
+			return;
+		}
+
+		func = reinterpret_cast<decltype(func)>(GetProcAddress(dwm,
+						"DwmEnableComposition"));
+		if (!func) {
+			failed = true;
+			return;
+		}
+	}
+
+	func(enable ? DWM_EC_ENABLECOMPOSITION : DWM_EC_DISABLECOMPOSITION);
 }

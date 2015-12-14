@@ -37,8 +37,12 @@ using namespace DShow;
 #define LAST_VIDEO_DEV_ID "last_video_device_id"
 #define LAST_RESOLUTION   "last_resolution"
 #define BUFFERING_VAL     "buffering"
+#define FLIP_IMAGE        "flip_vertically"
+#define AUDIO_OUTPUT_MODE "audio_output_mode"
 #define USE_CUSTOM_AUDIO  "use_custom_audio_device"
 #define AUDIO_DEVICE_ID   "audio_device_id"
+#define COLOR_SPACE       "color_space"
+#define COLOR_RANGE       "color_range"
 
 #define TEXT_INPUT_NAME     obs_module_text("VideoCaptureDevice")
 #define TEXT_DEVICE         obs_module_text("Device")
@@ -56,10 +60,20 @@ using namespace DShow;
 #define TEXT_BUFFERING_AUTO obs_module_text("Buffering.AutoDetect")
 #define TEXT_BUFFERING_ON   obs_module_text("Buffering.Enable")
 #define TEXT_BUFFERING_OFF  obs_module_text("Buffering.Disable")
+#define TEXT_FLIP_IMAGE     obs_module_text("FlipVertically")
+#define TEXT_AUDIO_MODE     obs_module_text("AudioOutputMode")
+#define TEXT_MODE_CAPTURE   obs_module_text("AudioOutputMode.Capture")
+#define TEXT_MODE_DSOUND    obs_module_text("AudioOutputMode.DirectSound")
+#define TEXT_MODE_WAVEOUT   obs_module_text("AudioOutputMode.WaveOut")
 #define TEXT_CUSTOM_AUDIO   obs_module_text("UseCustomAudioDevice")
 #define TEXT_AUDIO_DEVICE   obs_module_text("AudioDevice")
 #define TEXT_ACTIVATE       obs_module_text("Activate")
 #define TEXT_DEACTIVATE     obs_module_text("Deactivate")
+#define TEXT_COLOR_SPACE    obs_module_text("ColorSpace")
+#define TEXT_COLOR_DEFAULT  obs_module_text("ColorSpace.Default")
+#define TEXT_COLOR_RANGE    obs_module_text("ColorRange")
+#define TEXT_RANGE_PARTIAL  obs_module_text("ColorRange.Partial")
+#define TEXT_RANGE_FULL     obs_module_text("ColorRange.Full")
 
 enum ResType {
 	ResType_Preferred,
@@ -147,6 +161,7 @@ struct DShowInput {
 	obs_source_t *source;
 	Device       device;
 	bool         deviceHasAudio = false;
+	bool         flip = false;
 	bool         active = false;
 
 	Decoder      audio_decoder;
@@ -223,7 +238,9 @@ struct DShowInput {
 	bool UpdateVideoConfig(obs_data_t *settings);
 	bool UpdateAudioConfig(obs_data_t *settings);
 	void SetActive(bool active);
-	inline void Activate(obs_data_t *settings);
+	inline enum video_colorspace GetColorSpace(obs_data_t *settings) const;
+	inline enum video_range_type GetColorRange(obs_data_t *settings) const;
+	inline bool Activate(obs_data_t *settings);
 	inline void Deactivate();
 
 	inline void SetupBuffering(obs_data_t *settings);
@@ -279,7 +296,10 @@ void DShowInput::DShowLoop()
 			{
 				obs_data_t *settings;
 				settings = obs_source_get_settings(source);
-				Activate(settings);
+				if (!Activate(settings)) {
+					obs_source_output_video(source,
+							nullptr);
+				}
 				obs_data_release(settings);
 				break;
 			}
@@ -395,6 +415,8 @@ void DShowInput::OnEncodedVideoData(enum AVCodecID id,
 
 	if (got_output) {
 		frame.timestamp = (uint64_t)ts * 100;
+		if (flip)
+			frame.flip = !frame.flip;
 #if LOG_ENCODED_VIDEO_TS
 		blog(LOG_DEBUG, "video ts: %llu", frame.timestamp);
 #endif
@@ -421,6 +443,9 @@ void DShowInput::OnVideoData(const VideoConfig &config,
 	frame.full_range = false;
 	frame.flip       = (config.format == VideoFormat::XRGB ||
 	                    config.format == VideoFormat::ARGB);
+
+	if (flip)
+		frame.flip = !frame.flip;
 
 	if (videoConfig.format == VideoFormat::XRGB ||
 	    videoConfig.format == VideoFormat::ARGB) {
@@ -569,15 +594,18 @@ static inline bool ResolutionValid(string res, int &cx, int &cy)
 	return ConvertRes(cx, cy, res.c_str());
 }
 
+static inline bool CapsMatch(const VideoInfo&)
+{
+	return true;
+}
+
+template <typename ... F>
+static bool CapsMatch(const VideoDevice &dev, F ... fs);
+
 template <typename F, typename ... Fs>
 static inline bool CapsMatch(const VideoInfo &info, F&& f, Fs ... fs)
 {
 	return f(info) && CapsMatch(info, fs ...);
-}
-
-static inline bool CapsMatch(const VideoInfo&)
-{
-	return true;
 }
 
 template <typename ... F>
@@ -710,9 +738,12 @@ inline void DShowInput::SetupBuffering(obs_data_t *settings)
 	obs_source_set_flags(source, flags);
 }
 
+static DStr GetVideoFormatName(VideoFormat format);
+
 bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 {
 	string video_device_id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+	flip = obs_data_get_bool(settings, FLIP_IMAGE);
 
 	DeviceId id;
 	if (!DecodeDeviceId(id, video_device_id.c_str()))
@@ -756,8 +787,6 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 			return false;
 
 		interval = best_interval;
-		blog(LOG_INFO, "%s: Using interval %lld",
-				obs_source_get_name(source), interval);
 	}
 
 	videoConfig.name             = id.name.c_str();
@@ -786,6 +815,34 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 		if (!device.SetVideoConfig(&videoConfig))
 			return false;
 	}
+
+	DStr formatName = GetVideoFormatName(videoConfig.internalFormat);
+
+	double fps = 0.0;
+
+	if (videoConfig.frameInterval)
+		fps = 10000000.0 / double(videoConfig.frameInterval);
+
+	BPtr<char> name_utf8;
+	BPtr<char> path_utf8;
+	os_wcs_to_utf8_ptr(videoConfig.name.c_str(), videoConfig.name.size(),
+			&name_utf8);
+	os_wcs_to_utf8_ptr(videoConfig.path.c_str(), videoConfig.path.size(),
+			&path_utf8);
+
+	blog(LOG_INFO, "---------------------------------");
+	blog(LOG_INFO, "[DShow Device: '%s'] settings updated: \n"
+			"\tvideo device: %s\n"
+			"\tvideo path: %s\n"
+			"\tresolution: %dx%d\n"
+			"\tfps: %0.2f (interval: %lld)\n"
+			"\tformat: %s",
+			obs_source_get_name(source),
+			(const char*)name_utf8,
+			(const char*)path_utf8,
+			videoConfig.cx, videoConfig.cy,
+			fps, videoConfig.frameInterval,
+			formatName->array);
 
 	SetupBuffering(settings);
 
@@ -816,7 +873,38 @@ bool DShowInput::UpdateAudioConfig(obs_data_t *settings)
 			placeholders::_3, placeholders::_4,
 			placeholders::_5);
 
-	return device.SetAudioConfig(&audioConfig);
+	audioConfig.mode =
+		(AudioMode)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
+
+	bool success = device.SetAudioConfig(&audioConfig);
+	if (!success)
+		return false;
+
+	BPtr<char> name_utf8;
+	os_wcs_to_utf8_ptr(audioConfig.name.c_str(), audioConfig.name.size(),
+			&name_utf8);
+
+	blog(LOG_INFO, "\tusing video device audio: %s",
+			audioConfig.useVideoDevice ? "yes" : "no");
+
+	if (!audioConfig.useVideoDevice)
+		blog(LOG_INFO, "\taudio device: %s", (const char*)name_utf8);
+
+	const char *mode = "";
+
+	switch (audioConfig.mode) {
+		case AudioMode::Capture:     mode = "Capture"; break;
+		case AudioMode::DirectSound: mode = "DirectSound"; break;
+		case AudioMode::WaveOut:     mode = "WaveOut"; break;
+	}
+
+	blog(LOG_INFO, "\tsample rate: %d\n"
+			"\tchannels: %d\n"
+			"\taudio type: %s",
+			audioConfig.sampleRate,
+			audioConfig.channels,
+			mode);
+	return true;
 }
 
 void DShowInput::SetActive(bool active_)
@@ -828,15 +916,38 @@ void DShowInput::SetActive(bool active_)
 	obs_data_release(settings);
 }
 
-inline void DShowInput::Activate(obs_data_t *settings)
+inline enum video_colorspace DShowInput::GetColorSpace(
+		obs_data_t *settings) const
+{
+	const char *space = obs_data_get_string(settings, COLOR_SPACE);
+
+	if (astrcmpi(space, "709") == 0)
+		return VIDEO_CS_709;
+	else if (astrcmpi(space, "601") == 0)
+		return VIDEO_CS_601;
+	else
+		return (videoConfig.format == VideoFormat::HDYC) ?
+			VIDEO_CS_709 : VIDEO_CS_601;
+}
+
+inline enum video_range_type DShowInput::GetColorRange(
+		obs_data_t *settings) const
+{
+	const char *range = obs_data_get_string(settings, COLOR_RANGE);
+
+	return astrcmpi(range, "full") == 0 ?
+		VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+}
+
+inline bool DShowInput::Activate(obs_data_t *settings)
 {
 	if (!device.ResetGraph())
-		return;
+		return false;
 
 	if (!UpdateVideoConfig(settings)) {
 		blog(LOG_WARNING, "%s: Video configuration failed",
 				obs_source_get_name(source));
-		return;
+		return false;
 	}
 
 	if (!UpdateAudioConfig(settings))
@@ -844,21 +955,24 @@ inline void DShowInput::Activate(obs_data_t *settings)
 		                  "audio", obs_source_get_name(source));
 
 	if (!device.ConnectFilters())
-		return;
+		return false;
 
 	if (device.Start() != Result::Success)
-		return;
+		return false;
 
-	enum video_colorspace cs = (videoConfig.format == VideoFormat::HDYC) ?
-		VIDEO_CS_709 : VIDEO_CS_601;
+	enum video_colorspace cs = GetColorSpace(settings);
 
-	if (!video_format_get_parameters(cs, VIDEO_RANGE_PARTIAL,
+	bool success = video_format_get_parameters(
+			cs, GetColorRange(settings),
 			frame.color_matrix,
 			frame.color_range_min,
-			frame.color_range_max)) {
+			frame.color_range_max);
+	if (!success) {
 		blog(LOG_ERROR, "Failed to get video format parameters for " \
 		                "video format %u", cs);
 	}
+
+	return true;
 }
 
 inline void DShowInput::Deactivate()
@@ -869,7 +983,7 @@ inline void DShowInput::Deactivate()
 
 /* ------------------------------------------------------------------------- */
 
-static const char *GetDShowInputName(void)
+static const char *GetDShowInputName(void*)
 {
 	return TEXT_INPUT_NAME;
 }
@@ -907,6 +1021,11 @@ static void GetDShowDefaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, FRAME_INTERVAL, FPS_MATCHING);
 	obs_data_set_default_int(settings, RES_TYPE, ResType_Preferred);
 	obs_data_set_default_int(settings, VIDEO_FORMAT, (int)VideoFormat::Any);
+	obs_data_set_default_bool(settings, "active", true);
+	obs_data_set_default_string(settings, COLOR_SPACE, "default");
+	obs_data_set_default_string(settings, COLOR_RANGE, "partial");
+	obs_data_set_default_int(settings, AUDIO_OUTPUT_MODE,
+			(int)AudioMode::Capture);
 }
 
 struct Resolution {
@@ -1149,12 +1268,6 @@ static bool DeviceSelectionChanged(obs_properties_t *props, obs_property_t *p,
 		p = obs_properties_get(props, RES_TYPE);
 		ResTypeChanged(props, p, settings);
 		obs_data_set_string(settings, LAST_VIDEO_DEV_ID, id.c_str());
-
-		if (data->input) {
-			data->input->SetActive(false);
-			p = obs_properties_get(props, "activate");
-			obs_property_set_description(p, TEXT_ACTIVATE);
-		}
 	}
 
 	return true;
@@ -1399,7 +1512,6 @@ static void UpdateVideoFormats(VideoDevice &device, VideoFormat format_,
 static bool UpdateFPS(long long interval, obs_property_t *list)
 {
 	size_t size = obs_property_list_item_count(list);
-	bool fps_found = false;
 	DStr name;
 
 	for (size_t i = 0; i < size; i++) {
@@ -1411,7 +1523,6 @@ static bool UpdateFPS(long long interval, obs_property_t *list)
 			return false;
 
 		dstr_cat(name, obs_property_list_item_name(list, i));
-		fps_found = true;
 		break;
 	}
 
@@ -1475,9 +1586,11 @@ static bool DeviceIntervalChanged(obs_properties_t *props, obs_property_t *p,
 			}
 		}
 
-		if (listed_val != val)
+		if (listed_val != val) {
 			obs_data_set_autoselect_int(settings, FRAME_INTERVAL,
 					listed_val);
+			val = listed_val;
+		}
 
 	} else {
 		obs_data_unset_autoselect_value(settings, FRAME_INTERVAL);
@@ -1628,6 +1741,17 @@ static obs_properties_t *GetDShowProperties(void *obj)
 
 	obs_property_set_modified_callback(p, VideoFormatChanged);
 
+	p = obs_properties_add_list(ppts, COLOR_SPACE, TEXT_COLOR_SPACE,
+			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, TEXT_COLOR_DEFAULT, "default");
+	obs_property_list_add_string(p, "709", "709");
+	obs_property_list_add_string(p, "601", "601");
+
+	p = obs_properties_add_list(ppts, COLOR_RANGE, TEXT_COLOR_RANGE,
+			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p, TEXT_RANGE_PARTIAL, "partial");
+	obs_property_list_add_string(p, TEXT_RANGE_FULL, "full");
+
 	p = obs_properties_add_list(ppts, BUFFERING_VAL, TEXT_BUFFERING,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, TEXT_BUFFERING_AUTO,
@@ -1637,12 +1761,23 @@ static obs_properties_t *GetDShowProperties(void *obj)
 	obs_property_list_add_int(p, TEXT_BUFFERING_OFF,
 			(int64_t)BufferingType::Off);
 
+	obs_properties_add_bool(ppts, FLIP_IMAGE, TEXT_FLIP_IMAGE);
+
 	/* ------------------------------------- */
 	/* audio settings */
 
 	Device::EnumAudioDevices(data->audioDevices);
 	if (!data->audioDevices.size())
 		return ppts;
+
+	p = obs_properties_add_list(ppts, AUDIO_OUTPUT_MODE, TEXT_AUDIO_MODE,
+			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, TEXT_MODE_CAPTURE,
+			(int64_t)AudioMode::Capture);
+	obs_property_list_add_int(p, TEXT_MODE_DSOUND,
+			(int64_t)AudioMode::DirectSound);
+	obs_property_list_add_int(p, TEXT_MODE_WAVEOUT,
+			(int64_t)AudioMode::WaveOut);
 
 	p = obs_properties_add_bool(ppts, USE_CUSTOM_AUDIO, TEXT_CUSTOM_AUDIO);
 

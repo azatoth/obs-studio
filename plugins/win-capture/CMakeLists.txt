@@ -3,6 +3,7 @@ project(win-capture)
 set(win-capture_HEADERS
 	obfuscate.h
 	hook-helpers.h
+	inject-library.h
 	cursor-capture.h
 	graphics-hook-info.h
 	window-helpers.h
@@ -11,6 +12,7 @@ set(win-capture_HEADERS
 set(win-capture_SOURCES
 	dc-capture.c
 	obfuscate.c
+	inject-library.c
 	cursor-capture.c
 	game-capture.c
 	window-helpers.c
@@ -26,7 +28,7 @@ add_library(win-capture MODULE
 target_link_libraries(win-capture
 	libobs
 	ipc-util
-	psapi.lib)
+	psapi)
 
 install_obs_plugin_with_data(win-capture data)
 

@@ -95,6 +95,7 @@ bool load_graphics_imports(struct gs_exports *exports, void *module,
 	GRAPHICS_IMPORT(device_enable_stencil_write);
 	GRAPHICS_IMPORT(device_enable_color);
 	GRAPHICS_IMPORT(device_blend_function);
+	GRAPHICS_IMPORT(device_blend_function_separate);
 	GRAPHICS_IMPORT(device_depth_function);
 	GRAPHICS_IMPORT(device_stencil_function);
 	GRAPHICS_IMPORT(device_stencil_op);
@@ -124,7 +125,7 @@ bool load_graphics_imports(struct gs_exports *exports, void *module,
 	GRAPHICS_IMPORT(gs_voltexture_destroy);
 	GRAPHICS_IMPORT(gs_voltexture_get_width);
 	GRAPHICS_IMPORT(gs_voltexture_get_height);
-	GRAPHICS_IMPORT(gs_voltexture_getdepth);
+	GRAPHICS_IMPORT(gs_voltexture_get_depth);
 	GRAPHICS_IMPORT(gs_voltexture_get_color_format);
 
 	GRAPHICS_IMPORT(gs_stagesurface_destroy);
@@ -158,7 +159,7 @@ bool load_graphics_imports(struct gs_exports *exports, void *module,
 	GRAPHICS_IMPORT(gs_shader_set_bool);
 	GRAPHICS_IMPORT(gs_shader_set_float);
 	GRAPHICS_IMPORT(gs_shader_set_int);
-	GRAPHICS_IMPORT(gs_shader_setmatrix3);
+	GRAPHICS_IMPORT(gs_shader_set_matrix3);
 	GRAPHICS_IMPORT(gs_shader_set_matrix4);
 	GRAPHICS_IMPORT(gs_shader_set_vec2);
 	GRAPHICS_IMPORT(gs_shader_set_vec3);

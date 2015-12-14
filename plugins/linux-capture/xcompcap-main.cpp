@@ -132,6 +132,7 @@ struct XCompcapMain_private
 
 	obs_source_t *source;
 
+	std::string windowName;
 	Window win;
 	int cut_top, cur_cut_top;
 	int cut_left, cur_cut_left;
@@ -272,6 +273,7 @@ void XCompcapMain::updateSettings(obs_data_t *settings)
 		const char *windowName = obs_data_get_string(settings,
 				"capture_window");
 
+		p->windowName = windowName;
 		p->win = getWindowFromString(windowName);
 
 		p->cut_top = obs_data_get_int(settings, "cut_top");
@@ -456,6 +458,20 @@ void XCompcapMain::tick(float seconds)
 	if (XCompcap::windowWasReconfigured(p->win))
 		updateSettings(0);
 
+	XErrorLock xlock;
+	xlock.resetError();
+	XWindowAttributes attr;
+
+	if (!XGetWindowAttributes(xdisp, p->win, &attr)) {
+		Window newWin = getWindowFromString(p->windowName);
+
+		if (XGetWindowAttributes(xdisp, newWin, &attr)) {
+			p->win = newWin;
+			updateSettings(0);
+		}
+		return;
+	}
+
 	if (!p->tex || !p->gltex)
 		return;
 
@@ -501,6 +517,7 @@ void XCompcapMain::tick(float seconds)
 void XCompcapMain::render(gs_effect_t *effect)
 {
 	PLock lock(&p->lock, true);
+	effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 
 	if (!lock.isLocked() || !p->tex)
 		return;
@@ -508,13 +525,17 @@ void XCompcapMain::render(gs_effect_t *effect)
 	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
 	gs_effect_set_texture(image, p->tex);
 
-	gs_enable_blending(false);
-	gs_draw_sprite(p->tex, 0, 0, 0);
+	while (gs_effect_loop(effect, "Draw")) {
+		gs_draw_sprite(p->tex, 0, 0, 0);
+	}
 
-	if (p->cursor && p->gltex && p->show_cursor && !p->cursor_outside)
-		xcursor_render(p->cursor);
+	if (p->cursor && p->gltex && p->show_cursor && !p->cursor_outside) {
+		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
-	gs_reset_blend_state();
+		while (gs_effect_loop(effect, "Draw")) {
+			xcursor_render(p->cursor);
+		}
+	}
 }
 
 uint32_t XCompcapMain::width()

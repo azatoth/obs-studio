@@ -21,6 +21,11 @@
 #include "qt-wrappers.hpp"
 #include "obs-app.hpp"
 
+struct AddSourceData {
+	obs_source_t *source;
+	bool visible;
+};
+
 bool OBSBasicSourceSelect::EnumSources(void *data, obs_source_t *source)
 {
 	OBSBasicSourceSelect *window = static_cast<OBSBasicSourceSelect*>(data);
@@ -79,7 +84,16 @@ void OBSBasicSourceSelect::SourceRemoved(OBSSource source)
 	delete items[0];
 }
 
-static void AddExisting(const char *name)
+static void AddSource(void *_data, obs_scene_t *scene)
+{
+	AddSourceData *data = (AddSourceData *)_data;
+	obs_sceneitem_t *sceneitem;
+
+	sceneitem = obs_scene_add(scene, data->source);
+	obs_sceneitem_set_visible(sceneitem, data->visible);
+}
+
+static void AddExisting(const char *name, const bool visible)
 {
 	obs_source_t *source = obs_get_output_source(0);
 	obs_scene_t  *scene  = obs_scene_from_source(source);
@@ -88,14 +102,19 @@ static void AddExisting(const char *name)
 
 	source = obs_get_source_by_name(name);
 	if (source) {
-		obs_scene_add(scene, source);
+		AddSourceData data;
+		data.source = source;
+		data.visible = visible;
+		obs_scene_atomic_update(scene, AddSource, &data);
+
 		obs_source_release(source);
 	}
 
 	obs_scene_release(scene);
 }
 
-bool AddNew(QWidget *parent, const char *id, const char *name)
+bool AddNew(QWidget *parent, const char *id, const char *name,
+		const bool visible, OBSSource &newSource)
 {
 	obs_source_t *source  = obs_get_output_source(0);
 	obs_scene_t  *scene   = obs_scene_from_source(source);
@@ -111,11 +130,17 @@ bool AddNew(QWidget *parent, const char *id, const char *name)
 
 	} else {
 		source = obs_source_create(OBS_SOURCE_TYPE_INPUT,
-				id, name, NULL);
+				id, name, NULL, nullptr);
 
 		if (source) {
 			obs_add_source(source);
-			obs_scene_add(scene, source);
+
+			AddSourceData data;
+			data.source = source;
+			data.visible = visible;
+			obs_scene_atomic_update(scene, AddSource, &data);
+
+			newSource = source;
 
 			success = true;
 		}
@@ -130,13 +155,14 @@ bool AddNew(QWidget *parent, const char *id, const char *name)
 void OBSBasicSourceSelect::on_buttonBox_accepted()
 {
 	bool useExisting = ui->selectExisting->isChecked();
+	bool visible = ui->sourceVisible->isChecked();
 
 	if (useExisting) {
 		QListWidgetItem *item = ui->sourceList->currentItem();
 		if (!item)
 			return;
 
-		AddExisting(QT_TO_UTF8(item->text()));
+		AddExisting(QT_TO_UTF8(item->text()), visible);
 	} else {
 		if (ui->sourceName->text().isEmpty()) {
 			QMessageBox::information(this,
@@ -145,7 +171,8 @@ void OBSBasicSourceSelect::on_buttonBox_accepted()
 			return;
 		}
 
-		if (!AddNew(this, id, QT_TO_UTF8(ui->sourceName->text())))
+		if (!AddNew(this, id, QT_TO_UTF8(ui->sourceName->text()),
+					visible, newSource))
 			return;
 	}
 
@@ -164,6 +191,8 @@ OBSBasicSourceSelect::OBSBasicSourceSelect(OBSBasic *parent, const char *id_)
 {
 	ui->setupUi(this);
 
+	ui->sourceList->setAttribute(Qt::WA_MacShowFocusRect, false);
+
 	QString placeHolderText{QT_UTF8(obs_source_get_display_name(
 				OBS_SOURCE_TYPE_INPUT, id))};
 
@@ -178,6 +207,8 @@ OBSBasicSourceSelect::OBSBasicSourceSelect(OBSBasic *parent, const char *id_)
 	ui->sourceName->setText(text);
 	ui->sourceName->setFocus();	//Fixes deselect of text.
 	ui->sourceName->selectAll();
+
+	installEventFilter(CreateShortcutFilter());
 
 	obs_enum_sources(EnumSources, this);
 }

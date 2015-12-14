@@ -32,7 +32,7 @@ struct obs_service_info {
 	/* required */
 	const char *id;
 
-	const char *(*get_name)(void);
+	const char *(*get_name)(void *type_data);
 	void *(*create)(obs_data_t *settings, obs_service_t *service);
 	void (*destroy)(void *data);
 
@@ -62,6 +62,15 @@ struct obs_service_info {
 
 	const char *(*get_username)(void *data);
 	const char *(*get_password)(void *data);
+
+	bool (*supports_multitrack)(void *data);
+
+	void (*apply_encoder_settings)(void *data,
+			obs_data_t *video_encoder_settings,
+			obs_data_t *audio_encoder_settings);
+
+	void *type_data;
+	void (*free_type_data)(void *type_data);
 
 	/* TODO: more stuff later */
 };

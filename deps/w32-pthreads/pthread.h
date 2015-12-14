@@ -27,7 +27,7 @@
  *      You should have received a copy of the GNU Lesser General Public
  *      License along with this library in the file COPYING.LIB;
  *      if not, write to the Free Software Foundation, Inc.,
- *      59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+ *      51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
 #if !defined( PTHREAD_H )
@@ -204,6 +204,10 @@
  */
 typedef unsigned long DWORD_PTR;
 typedef unsigned long ULONG_PTR;
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER >= 1900
+#define HAVE_STRUCT_TIMESPEC
 #endif
 /*
  * -----------------

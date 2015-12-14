@@ -30,8 +30,7 @@ struct gs_exports {
 			bool (*callback)(void*, const char*, uint32_t),
 			void*);
 	const char *(*device_preprocessor_name)(void);
-	int (*device_create)(gs_device_t **device,
-			const struct gs_init_data *data);
+	int (*device_create)(gs_device_t **device, uint32_t adapter);
 	void (*device_destroy)(gs_device_t *device);
 	void (*device_enter_context)(gs_device_t *device);
 	void (*device_leave_context)(gs_device_t *device);
@@ -125,6 +124,9 @@ struct gs_exports {
 			bool blue, bool alpha);
 	void (*device_blend_function)(gs_device_t *device,
 			enum gs_blend_type src, enum gs_blend_type dest);
+	void (*device_blend_function_separate)(gs_device_t *device,
+			enum gs_blend_type src_c, enum gs_blend_type dest_c,
+			enum gs_blend_type src_a, enum gs_blend_type dest_a);
 	void (*device_depth_function)(gs_device_t *device,
 			enum gs_depth_test test);
 	void (*device_stencil_function)(gs_device_t *device,
@@ -168,7 +170,7 @@ struct gs_exports {
 	void     (*gs_voltexture_destroy)(gs_texture_t *voltex);
 	uint32_t (*gs_voltexture_get_width)(const gs_texture_t *voltex);
 	uint32_t (*gs_voltexture_get_height)(const gs_texture_t *voltex);
-	uint32_t (*gs_voltexture_getdepth)(const gs_texture_t *voltex);
+	uint32_t (*gs_voltexture_get_depth)(const gs_texture_t *voltex);
 	enum gs_color_format (*gs_voltexture_get_color_format)(
 			const gs_texture_t *voltex);
 
@@ -212,7 +214,7 @@ struct gs_exports {
 	void (*gs_shader_set_bool)(gs_sparam_t *param, bool val);
 	void (*gs_shader_set_float)(gs_sparam_t *param, float val);
 	void (*gs_shader_set_int)(gs_sparam_t *param, int val);
-	void (*gs_shader_setmatrix3)(gs_sparam_t *param,
+	void (*gs_shader_set_matrix3)(gs_sparam_t *param,
 			const struct matrix3 *val);
 	void (*gs_shader_set_matrix4)(gs_sparam_t *param,
 			const struct matrix4 *val);
@@ -258,8 +260,10 @@ struct gs_exports {
 
 struct blend_state {
 	bool               enabled;
-	enum gs_blend_type src;
-	enum gs_blend_type dest;
+	enum gs_blend_type src_c;
+	enum gs_blend_type dest_c;
+	enum gs_blend_type src_a;
+	enum gs_blend_type dest_a;
 };
 
 struct graphics_subsystem {
@@ -285,8 +289,12 @@ struct graphics_subsystem {
 	DARRAY(uint32_t)       colors;
 	DARRAY(struct vec2)    texverts[16];
 
+	pthread_mutex_t        effect_mutex;
+	struct gs_effect       *first_effect;
+
 	pthread_mutex_t        mutex;
 	volatile long          ref;
 
 	struct blend_state     cur_blend_state;
+	DARRAY(struct blend_state) blend_state_stack;
 };

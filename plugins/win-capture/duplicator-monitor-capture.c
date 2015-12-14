@@ -60,8 +60,9 @@ static inline void update_settings(struct duplicator_capture *capture,
 
 /* ------------------------------------------------------------------------- */
 
-static const char *duplicator_capture_getname(void)
+static const char *duplicator_capture_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return TEXT_MONITOR_CAPTURE;
 }
 
@@ -194,29 +195,24 @@ static void duplicator_capture_render(void *data, gs_effect_t *effect)
 	if (!texture)
 		return;
 
-	effect = obs_get_default_effect();
+	effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 
 	rot = capture->rot;
 
 	while (gs_effect_loop(effect, "Draw")) {
-		gs_enable_blending(false);
-		gs_enable_color(true, true, true, false);
-
 		if (rot != 0) {
-			float x;
-			float y;
+			float x = 0.0f;
+			float y = 0.0f;
 
 			switch (rot) {
 			case 90:
 				x = (float)capture->height;
-				y = 0.0f;
 				break;
 			case 180:
 				x = (float)capture->width;
 				y = (float)capture->height;
 				break;
 			case 270:
-				x = 0.0f;
 				y = (float)capture->width;
 				break;
 			}
@@ -230,12 +226,14 @@ static void duplicator_capture_render(void *data, gs_effect_t *effect)
 
 		if (rot != 0)
 			gs_matrix_pop();
+	}
 
-		gs_enable_blending(true);
-		gs_enable_color(true, true, true, true);
+	if (capture->capture_cursor) {
+		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
-		if (capture->capture_cursor)
+		while (gs_effect_loop(effect, "Draw")) {
 			draw_cursor(capture);
+		}
 	}
 }
 
@@ -271,8 +269,7 @@ static obs_properties_t *duplicator_capture_properties(void *unused)
 		"monitor", TEXT_MONITOR,
 		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 
-	obs_property_t *capture_cursor = obs_properties_add_bool(props,
-		"capture_cursor", TEXT_CAPTURE_CURSOR);
+	obs_properties_add_bool(props, "capture_cursor", TEXT_CAPTURE_CURSOR);
 
 	obs_enter_graphics();
 

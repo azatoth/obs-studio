@@ -21,6 +21,7 @@
 #include "qt-wrappers.hpp"
 #include "display-helpers.hpp"
 
+#include <QKeyEvent>
 #include <QCloseEvent>
 #include <QScreen>
 #include <QWindow>
@@ -30,11 +31,12 @@ using namespace std;
 OBSBasicInteraction::OBSBasicInteraction(QWidget *parent, OBSSource source_)
 	: QDialog       (parent),
 	  main          (qobject_cast<OBSBasic*>(parent)),
-	  resizeTimer   (0),
 	  ui            (new Ui::OBSBasicInteraction),
 	  source        (source_),
 	  removedSignal (obs_source_get_signal_handler(source), "remove",
 	                 OBSBasicInteraction::SourceRemoved, this),
+	  renamedSignal (obs_source_get_signal_handler(source), "rename",
+	                 OBSBasicInteraction::SourceRenamed, this),
 	  eventFilter   (BuildEventFilter())
 {
 	int cx = (int)config_get_int(App()->GlobalConfig(), "InteractionWindow",
@@ -54,14 +56,16 @@ OBSBasicInteraction::OBSBasicInteraction(QWidget *parent, OBSSource source_)
 	OBSData settings = obs_source_get_settings(source);
 	obs_data_release(settings);
 
-	connect(windowHandle(), &QWindow::screenChanged, [this]() {
-		if (resizeTimer)
-			killTimer(resizeTimer);
-		resizeTimer = startTimer(100);
-	});
-
 	const char *name = obs_source_get_name(source);
 	setWindowTitle(QTStr("Basic.InteractionWindow").arg(QT_UTF8(name)));
+
+	auto addDrawCallback = [this] ()
+	{
+		obs_display_add_draw_callback(ui->preview->GetDisplay(),
+				OBSBasicInteraction::DrawPreview, this);
+	};
+
+	connect(ui->preview, &OBSQTDisplay::DisplayCreated, addDrawCallback);
 }
 
 OBSBasicInteraction::~OBSBasicInteraction()
@@ -115,6 +119,15 @@ void OBSBasicInteraction::SourceRemoved(void *data, calldata_t *params)
 	UNUSED_PARAMETER(params);
 }
 
+void OBSBasicInteraction::SourceRenamed(void *data, calldata_t *params)
+{
+	const char *name = calldata_string(params, "new_name");
+	QString title = QTStr("Basic.InteractionWindow").arg(QT_UTF8(name));
+
+	QMetaObject::invokeMethod(static_cast<OBSBasicProperties*>(data),
+	                "setWindowTitle", Q_ARG(QString, title));
+}
+
 void OBSBasicInteraction::DrawPreview(void *data, uint32_t cx, uint32_t cy)
 {
 	OBSBasicInteraction *window = static_cast<OBSBasicInteraction*>(data);
@@ -145,46 +158,11 @@ void OBSBasicInteraction::DrawPreview(void *data, uint32_t cx, uint32_t cy)
 	gs_viewport_pop();
 }
 
-void OBSBasicInteraction::OnInteractionResized()
-{
-	if (resizeTimer)
-		killTimer(resizeTimer);
-	resizeTimer = startTimer(100);
-}
-
-void OBSBasicInteraction::resizeEvent(QResizeEvent *event)
-{
-	if (isVisible()) {
-		if (resizeTimer)
-			killTimer(resizeTimer);
-		resizeTimer = startTimer(100);
-	}
-
-	UNUSED_PARAMETER(event);
-}
-
-void OBSBasicInteraction::timerEvent(QTimerEvent *event)
-{
-	if (event->timerId() == resizeTimer) {
-		killTimer(resizeTimer);
-		resizeTimer = 0;
-
-		QSize size = GetPixelSize(ui->preview);
-		obs_display_resize(display, size.width(), size.height());
-	}
-}
-
 void OBSBasicInteraction::closeEvent(QCloseEvent *event)
 {
 	QDialog::closeEvent(event);
 	if (!event->isAccepted())
 		return;
-
-	// remove draw callback and release display in case our drawable
-	// surfaces go away before the destructor gets called
-	obs_display_remove_draw_callback(display,
-			OBSBasicInteraction::DrawPreview, this);
-	display = nullptr;
 
 	config_set_int(App()->GlobalConfig(), "InteractionWindow", "cx",
 			width());
@@ -384,19 +362,5 @@ bool OBSBasicInteraction::HandleKeyEvent(QKeyEvent *event)
 
 void OBSBasicInteraction::Init()
 {
-	gs_init_data init_data = {};
-
 	show();
-
-	QSize previewSize = GetPixelSize(ui->preview);
-	init_data.cx      = uint32_t(previewSize.width());
-	init_data.cy      = uint32_t(previewSize.height());
-	init_data.format  = GS_RGBA;
-	QTToGSWindow(ui->preview->winId(), init_data.window);
-
-	display = obs_display_create(&init_data);
-
-	if (display)
-		obs_display_add_draw_callback(display,
-				OBSBasicInteraction::DrawPreview, this);
 }

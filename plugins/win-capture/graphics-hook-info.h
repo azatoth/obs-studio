@@ -27,15 +27,12 @@
 
 struct d3d8_offsets {
 	uint32_t present;
-	uint32_t reset;
 };
 
 struct d3d9_offsets {
 	uint32_t present;
 	uint32_t present_ex;
 	uint32_t present_swap;
-	uint32_t reset;
-	uint32_t reset_ex;
 };
 
 struct dxgi_offsets {
@@ -106,7 +103,7 @@ static inline HANDLE get_hook_info(DWORD id)
 {
 	HANDLE handle;
 	char new_name[64];
-	sprintf(new_name, "%s%d", SHMEM_HOOK_INFO, id);
+	sprintf(new_name, "%s%lu", SHMEM_HOOK_INFO, id);
 
 	handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
 			PAGE_READWRITE, 0, sizeof(struct hook_info), new_name);

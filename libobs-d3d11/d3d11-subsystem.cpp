@@ -15,7 +15,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ******************************************************************************/
 
-#include <inttypes.h>
+#include <cinttypes>
 #include <util/base.h>
 #include <util/platform.h>
 #include <graphics/matrix3.h>
@@ -142,7 +142,7 @@ void gs_device::InitCompiler()
 	int ver = 49;
 
 	while (ver > 30) {
-		sprintf_s(d3dcompiler, 40, "D3DCompiler_%02d.dll", ver);
+		sprintf(d3dcompiler, "D3DCompiler_%02d.dll", ver);
 
 		HMODULE module = LoadLibraryA(d3dcompiler);
 		if (module) {
@@ -184,15 +184,12 @@ const static D3D_FEATURE_LEVEL featureLevels[] =
 	D3D_FEATURE_LEVEL_9_3,
 };
 
-void gs_device::InitDevice(const gs_init_data *data, IDXGIAdapter *adapter)
+void gs_device::InitDevice(uint32_t adapterIdx, IDXGIAdapter *adapter)
 {
 	wstring adapterName;
-	DXGI_SWAP_CHAIN_DESC swapDesc;
 	DXGI_ADAPTER_DESC desc;
-	D3D_FEATURE_LEVEL levelUsed;
-	HRESULT hr;
-
-	make_swap_desc(swapDesc, data);
+	D3D_FEATURE_LEVEL levelUsed = D3D_FEATURE_LEVEL_9_3;
+	HRESULT hr = 0;
 
 	uint32_t createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
@@ -205,26 +202,19 @@ void gs_device::InitDevice(const gs_init_data *data, IDXGIAdapter *adapter)
 	char *adapterNameUTF8;
 	os_wcs_to_utf8_ptr(adapterName.c_str(), 0, &adapterNameUTF8);
 	blog(LOG_INFO, "Loading up D3D11 on adapter %s (%" PRIu32 ")",
-			adapterNameUTF8, data->adapter);
+			adapterNameUTF8, adapterIdx);
 	bfree(adapterNameUTF8);
 
-	hr = D3D11CreateDeviceAndSwapChain(adapter, D3D_DRIVER_TYPE_UNKNOWN,
+	hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN,
 			NULL, createFlags, featureLevels,
 			sizeof(featureLevels) / sizeof(D3D_FEATURE_LEVEL),
-			D3D11_SDK_VERSION, &swapDesc,
-			defaultSwap.swap.Assign(), device.Assign(),
+			D3D11_SDK_VERSION, device.Assign(),
 			&levelUsed, context.Assign());
 	if (FAILED(hr))
-		throw UnsupportedHWError("Failed to create device and "
-		                         "swap chain", hr);
+		throw UnsupportedHWError("Failed to create device", hr);
 
 	blog(LOG_INFO, "D3D11 loaded sucessfully, feature level used: %u",
-			(uint32_t)levelUsed);
-
-	defaultSwap.device     = this;
-	defaultSwap.hwnd       = (HWND)data->window.hwnd;
-	defaultSwap.numBuffers = data->num_backbuffers;
-	defaultSwap.Init(data);
+			(unsigned int)levelUsed);
 }
 
 static inline void ConvertStencilSide(D3D11_DEPTH_STENCILOP_DESC &desc,
@@ -302,13 +292,13 @@ ID3D11BlendState *gs_device::AddBlendState()
 		bd.RenderTarget[i].BlendOp        = D3D11_BLEND_OP_ADD;
 		bd.RenderTarget[i].BlendOpAlpha   = D3D11_BLEND_OP_ADD;
 		bd.RenderTarget[i].SrcBlend =
-			ConvertGSBlendType(blendState.srcFactor);
+			ConvertGSBlendType(blendState.srcFactorC);
 		bd.RenderTarget[i].DestBlend =
-			ConvertGSBlendType(blendState.destFactor);
+			ConvertGSBlendType(blendState.destFactorC);
 		bd.RenderTarget[i].SrcBlendAlpha =
-			bd.RenderTarget[i].SrcBlend;
+			ConvertGSBlendType(blendState.srcFactorA);
 		bd.RenderTarget[i].DestBlendAlpha =
-			bd.RenderTarget[i].DestBlend;
+			ConvertGSBlendType(blendState.destFactorA);
 		bd.RenderTarget[i].RenderTargetWriteMask =
 			D3D11_COLOR_WRITE_ENABLE_ALL;
 	}
@@ -420,22 +410,8 @@ void gs_device::UpdateViewProjMatrix()
 				&curViewProjMatrix);
 }
 
-gs_device::gs_device(const gs_init_data *data)
-	: curRenderTarget      (NULL),
-	  curZStencilBuffer    (NULL),
-	  curRenderSide        (0),
-	  curIndexBuffer       (NULL),
-	  curVertexBuffer      (NULL),
-	  curVertexShader      (NULL),
-	  curPixelShader       (NULL),
-	  curSwapChain         (&defaultSwap),
-	  zstencilStateChanged (true),
-	  rasterStateChanged   (true),
-	  blendStateChanged    (true),
-	  curDepthStencilState (NULL),
-	  curRasterState       (NULL),
-	  curBlendState        (NULL),
-	  curToplogy           (D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
+gs_device::gs_device(uint32_t adapterIdx)
+	: curToplogy           (D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
 {
 	ComPtr<IDXGIAdapter1> adapter;
 
@@ -451,8 +427,8 @@ gs_device::gs_device(const gs_init_data *data)
 	}
 
 	InitCompiler();
-	InitFactory(data->adapter, adapter.Assign());
-	InitDevice(data, adapter);
+	InitFactory(adapterIdx, adapter.Assign());
+	InitDevice(adapterIdx, adapter);
 	device_set_render_target(this, NULL, NULL);
 }
 
@@ -528,7 +504,7 @@ static bool LogAdapterCallback(void *param, const char *name, uint32_t id)
 	return true;
 }
 
-int device_create(gs_device_t **p_device, const gs_init_data *data)
+int device_create(gs_device_t **p_device, uint32_t adapter)
 {
 	gs_device *device = NULL;
 	int errorcode = GS_SUCCESS;
@@ -539,7 +515,7 @@ int device_create(gs_device_t **p_device, const gs_init_data *data)
 		blog(LOG_INFO, "Available Video Adapters: ");
 		device_enum_adapters(LogAdapterCallback, nullptr);
 
-		device = new gs_device(data);
+		device = new gs_device(adapter);
 
 	} catch (UnsupportedHWError error) {
 		blog(LOG_ERROR, "device_create (D3D11): %s (%08lX)", error.str,
@@ -590,6 +566,11 @@ gs_swapchain_t *device_swapchain_create(gs_device_t *device,
 
 void device_resize(gs_device_t *device, uint32_t cx, uint32_t cy)
 {
+	if (!device->curSwapChain) {
+		blog(LOG_WARNING, "device_resize (D3D11): No active swap");
+		return;
+	}
+
 	try {
 		ID3D11RenderTargetView *renderView = NULL;
 		ID3D11DepthStencilView *depthView  = NULL;
@@ -612,18 +593,34 @@ void device_resize(gs_device_t *device, uint32_t cx, uint32_t cy)
 
 void device_get_size(const gs_device_t *device, uint32_t *cx, uint32_t *cy)
 {
-	*cx = device->curSwapChain->target.width;
-	*cy = device->curSwapChain->target.height;
+	if (device->curSwapChain) {
+		*cx = device->curSwapChain->target.width;
+		*cy = device->curSwapChain->target.height;
+	} else {
+		blog(LOG_ERROR, "device_get_size (D3D11): no active swap");
+		*cx = 0;
+		*cy = 0;
+	}
 }
 
 uint32_t device_get_width(const gs_device_t *device)
 {
-	return device->curSwapChain->target.width;
+	if (device->curSwapChain) {
+		return device->curSwapChain->target.width;
+	} else {
+		blog(LOG_ERROR, "device_get_size (D3D11): no active swap");
+		return 0;
+	}
 }
 
 uint32_t device_get_height(const gs_device_t *device)
 {
-	return device->curSwapChain->target.height;
+	if (device->curSwapChain) {
+		return device->curSwapChain->target.height;
+	} else {
+		blog(LOG_ERROR, "device_get_size (D3D11): no active swap");
+		return 0;
+	}
 }
 
 gs_texture_t *device_texture_create(gs_device_t *device, uint32_t width,
@@ -1029,46 +1026,51 @@ gs_zstencil_t *device_get_zstencil_target(const gs_device_t *device)
 void device_set_render_target(gs_device_t *device, gs_texture_t *tex,
 		gs_zstencil_t *zstencil)
 {
-	if (!tex)
-		tex = &device->curSwapChain->target;
-	if (!zstencil)
-		zstencil = &device->curSwapChain->zs;
+	if (device->curSwapChain) {
+		if (!tex)
+			tex = &device->curSwapChain->target;
+		if (!zstencil)
+			zstencil = &device->curSwapChain->zs;
+	}
 
 	if (device->curRenderTarget   == tex &&
 	    device->curZStencilBuffer == zstencil)
 		return;
 
-	if (tex->type != GS_TEXTURE_2D) {
+	if (tex && tex->type != GS_TEXTURE_2D) {
 		blog(LOG_ERROR, "device_set_render_target (D3D11): "
 		                "texture is not a 2D texture");
 		return;
 	}
 
 	gs_texture_2d *tex2d = static_cast<gs_texture_2d*>(tex);
-	if (!tex2d->renderTarget[0]) {
+	if (tex2d && !tex2d->renderTarget[0]) {
 		blog(LOG_ERROR, "device_set_render_target (D3D11): "
 		                "texture is not a render target");
 		return;
 	}
 
-	ID3D11RenderTargetView *rt = tex2d->renderTarget[0];
+	ID3D11RenderTargetView *rt = tex2d ? tex2d->renderTarget[0] : nullptr;
 
 	device->curRenderTarget   = tex2d;
 	device->curRenderSide     = 0;
 	device->curZStencilBuffer = zstencil;
-	device->context->OMSetRenderTargets(1, &rt, zstencil->view);
+	device->context->OMSetRenderTargets(1, &rt,
+			zstencil ? zstencil->view : nullptr);
 }
 
 void device_set_cube_render_target(gs_device_t *device, gs_texture_t *tex,
 		int side, gs_zstencil_t *zstencil)
 {
-	if (!tex) {
-		tex = &device->curSwapChain->target;
-		side = 0;
-	}
+	if (device->curSwapChain) {
+		if (!tex) {
+			tex = &device->curSwapChain->target;
+			side = 0;
+		}
 
-	if (!zstencil)
-		zstencil = &device->curSwapChain->zs;
+		if (!zstencil)
+			zstencil = &device->curSwapChain->zs;
+	}
 
 	if (device->curRenderTarget   == tex  &&
 	    device->curRenderSide     == side &&
@@ -1232,6 +1234,9 @@ void device_draw(gs_device_t *device, enum gs_draw_mode draw_mode,
 		if (!device->curVertexBuffer)
 			throw "No vertex buffer specified";
 
+		if (!device->curSwapChain && !device->curRenderTarget)
+			throw "No render target or swap chain to render to";
+
 		gs_effect_t *effect = gs_get_effect();
 		if (effect)
 			gs_effect_update_params(effect);
@@ -1280,15 +1285,15 @@ void device_load_swapchain(gs_device_t *device, gs_swapchain_t *swapchain)
 {
 	gs_texture_t  *target = device->curRenderTarget;
 	gs_zstencil_t *zs     = device->curZStencilBuffer;
-	bool is_cube = device->curRenderTarget->type == GS_TEXTURE_CUBE;
+	bool is_cube = device->curRenderTarget ?
+		(device->curRenderTarget->type == GS_TEXTURE_CUBE) : false;
 
-	if (target == &device->curSwapChain->target)
-		target = NULL;
-	if (zs == &device->curSwapChain->zs)
-		zs = NULL;
-
-	if (swapchain == NULL)
-		swapchain = &device->defaultSwap;
+	if (device->curSwapChain) {
+		if (target == &device->curSwapChain->target)
+			target = NULL;
+		if (zs == &device->curSwapChain->zs)
+			zs = NULL;
+	}
 
 	device->curSwapChain = swapchain;
 
@@ -1324,7 +1329,11 @@ void device_clear(gs_device_t *device, uint32_t clear_flags,
 
 void device_present(gs_device_t *device)
 {
-	device->curSwapChain->swap->Present(0, 0);
+	if (device->curSwapChain) {
+		device->curSwapChain->swap->Present(0, 0);
+	} else {
+		blog(LOG_WARNING, "device_present (D3D11): No active swap");
+	}
 }
 
 void device_flush(gs_device_t *device)
@@ -1401,13 +1410,34 @@ void device_enable_color(gs_device_t *device, bool red, bool green,
 void device_blend_function(gs_device_t *device, enum gs_blend_type src,
 		enum gs_blend_type dest)
 {
-	if (device->blendState.srcFactor  == src &&
-	    device->blendState.destFactor == dest)
+	if (device->blendState.srcFactorC  == src &&
+	    device->blendState.destFactorC == dest &&
+	    device->blendState.srcFactorA  == src &&
+	    device->blendState.destFactorA == dest)
 		return;
 
-	device->blendState.srcFactor  = src;
-	device->blendState.destFactor = dest;
+	device->blendState.srcFactorC = src;
+	device->blendState.destFactorC= dest;
+	device->blendState.srcFactorA = src;
+	device->blendState.destFactorA= dest;
 	device->blendStateChanged     = true;
+}
+
+void device_blend_function_separate(gs_device_t *device,
+		enum gs_blend_type src_c, enum gs_blend_type dest_c,
+		enum gs_blend_type src_a, enum gs_blend_type dest_a)
+{
+	if (device->blendState.srcFactorC  == src_c &&
+	    device->blendState.destFactorC == dest_c &&
+	    device->blendState.srcFactorA  == src_a &&
+	    device->blendState.destFactorA == dest_a)
+		return;
+
+	device->blendState.srcFactorC  = src_c;
+	device->blendState.destFactorC = dest_c;
+	device->blendState.srcFactorA  = src_a;
+	device->blendState.destFactorA = dest_a;
+	device->blendStateChanged      = true;
 }
 
 void device_depth_function(gs_device_t *device, enum gs_depth_test test)
@@ -1586,12 +1616,8 @@ void device_projection_pop(gs_device_t *device)
 
 void gs_swapchain_destroy(gs_swapchain_t *swapchain)
 {
-	if (!swapchain)
-		return;
-
-	gs_device *device = swapchain->device;
-	if (device->curSwapChain == swapchain)
-		device->curSwapChain = &device->defaultSwap;
+	if (swapchain->device->curSwapChain == swapchain)
+		device_load_swapchain(swapchain->device, nullptr);
 
 	delete swapchain;
 }
@@ -1708,7 +1734,7 @@ uint32_t gs_voltexture_get_height(const gs_texture_t *voltex)
 	return 0;
 }
 
-uint32_t gs_voltexture_getdepth(const gs_texture_t *voltex)
+uint32_t gs_voltexture_get_depth(const gs_texture_t *voltex)
 {
 	/* TODO */
 	UNUSED_PARAMETER(voltex);

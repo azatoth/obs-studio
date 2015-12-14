@@ -36,15 +36,15 @@ class OBSBasicInteraction : public QDialog {
 
 private:
 	OBSBasic   *main;
-	int        resizeTimer;
 
 	std::unique_ptr<Ui::OBSBasicInteraction> ui;
 	OBSSource  source;
-	OBSDisplay display;
 	OBSSignal  removedSignal;
+	OBSSignal  renamedSignal;
 	std::unique_ptr<OBSEventFilter> eventFilter;
 
 	static void SourceRemoved(void *data, calldata_t *params);
+	static void SourceRenamed(void *data, calldata_t *params);
 	static void DrawPreview(void *data, uint32_t cx, uint32_t cy);
 
 	bool GetSourceRelativeXY(int mouseX, int mouseY, int &x, int &y);
@@ -57,9 +57,6 @@ private:
 
 	OBSEventFilter *BuildEventFilter();
 
-private slots:
-	void OnInteractionResized();
-
 public:
 	OBSBasicInteraction(QWidget *parent, OBSSource source_);
 	~OBSBasicInteraction();
@@ -67,8 +64,6 @@ public:
 	void Init();
 
 protected:
-	virtual void resizeEvent(QResizeEvent *event) override;
-	virtual void timerEvent(QTimerEvent *event) override;
 	virtual void closeEvent(QCloseEvent *event) override;
 };
 
@@ -87,6 +82,7 @@ protected:
 	{
 		return filter(obj, event);
 	}
+
 private:
 	EventFilterFunc filter;
 };

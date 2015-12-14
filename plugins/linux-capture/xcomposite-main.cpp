@@ -55,7 +55,7 @@ void xcompcap_update(void *data, obs_data_t *settings)
 	cc->updateSettings(settings);
 }
 
-static const char* xcompcap_getname(void)
+static const char* xcompcap_getname(void*)
 {
 	return obs_module_text("XCCapture");
 }
@@ -69,7 +69,8 @@ extern "C" void xcomposite_load(void)
 	memset(&sinfo, 0, sizeof(obs_source_info));
 
 	sinfo.id = "xcomposite_input";
-	sinfo.output_flags = OBS_SOURCE_VIDEO;
+	sinfo.output_flags = OBS_SOURCE_VIDEO |
+	                     OBS_SOURCE_CUSTOM_DRAW;
 
 	sinfo.get_name       = xcompcap_getname;
 	sinfo.create         = xcompcap_create;

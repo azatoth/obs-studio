@@ -26,6 +26,7 @@ extern "C" {
 #define OBS_OUTPUT_AV          (OBS_OUTPUT_VIDEO | OBS_OUTPUT_AUDIO)
 #define OBS_OUTPUT_ENCODED     (1<<2)
 #define OBS_OUTPUT_SERVICE     (1<<3)
+#define OBS_OUTPUT_MULTI_TRACK (1<<4)
 
 struct encoder_packet;
 
@@ -35,7 +36,7 @@ struct obs_output_info {
 
 	uint32_t flags;
 
-	const char *(*get_name)(void);
+	const char *(*get_name)(void *type_data);
 
 	void *(*create)(obs_data_t *settings, obs_output_t *output);
 	void (*destroy)(void *data);
@@ -60,6 +61,9 @@ struct obs_output_info {
 	uint64_t (*get_total_bytes)(void *data);
 
 	int (*get_dropped_frames)(void *data);
+
+	void *type_data;
+	void (*free_type_data)(void *type_data);
 };
 
 EXPORT void obs_register_output_s(const struct obs_output_info *info,

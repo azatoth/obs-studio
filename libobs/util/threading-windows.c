@@ -20,36 +20,37 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-struct os_event_data {
-	HANDLE handle;
-};
-
-struct os_sem_data {
-	HANDLE handle;
-};
+#ifdef __MINGW32__
+#include <excpt.h>
+#ifndef TRYLEVEL_NONE
+#ifndef __MINGW64__
+#define NO_SEH_MINGW
+#endif
+#ifndef __try
+#define __try
+#endif
+#ifndef __except
+#define __except(x) if (0)
+#endif
+#endif
+#endif
 
 int os_event_init(os_event_t **event, enum os_event_type type)
 {
 	HANDLE handle;
-	struct os_event_data *data;
 
 	handle = CreateEvent(NULL, (type == OS_EVENT_TYPE_MANUAL), FALSE, NULL);
 	if (!handle)
 		return -1;
 
-	data = bmalloc(sizeof(struct os_event_data));
-	data->handle = handle;
-
-	*event = data;
+	*event = (os_event_t*)handle;
 	return 0;
 }
 
 void os_event_destroy(os_event_t *event)
 {
-	if (event) {
-		CloseHandle(event->handle);
-		bfree(event);
-	}
+	if (event)
+		CloseHandle((HANDLE)event);
 }
 
 int os_event_wait(os_event_t *event)
@@ -59,7 +60,7 @@ int os_event_wait(os_event_t *event)
 	if (!event)
 		return EINVAL;
 
-	code = WaitForSingleObject(event->handle, INFINITE);
+	code = WaitForSingleObject((HANDLE)event, INFINITE);
 	if (code != WAIT_OBJECT_0)
 		return EINVAL;
 
@@ -73,7 +74,7 @@ int os_event_timedwait(os_event_t *event, unsigned long milliseconds)
 	if (!event)
 		return EINVAL;
 
-	code = WaitForSingleObject(event->handle, milliseconds);
+	code = WaitForSingleObject((HANDLE)event, milliseconds);
 	if (code == WAIT_TIMEOUT)
 		return ETIMEDOUT;
 	else if (code != WAIT_OBJECT_0)
@@ -89,7 +90,7 @@ int os_event_try(os_event_t *event)
 	if (!event)
 		return EINVAL;
 
-	code = WaitForSingleObject(event->handle, 0);
+	code = WaitForSingleObject((HANDLE)event, 0);
 	if (code == WAIT_TIMEOUT)
 		return EAGAIN;
 	else if (code != WAIT_OBJECT_0)
@@ -103,7 +104,7 @@ int os_event_signal(os_event_t *event)
 	if (!event)
 		return EINVAL;
 
-	if (!SetEvent(event->handle))
+	if (!SetEvent((HANDLE)event))
 		return EINVAL;
 
 	return 0;
@@ -114,7 +115,7 @@ void os_event_reset(os_event_t *event)
 	if (!event)
 		return;
 
-	ResetEvent(event->handle);
+	ResetEvent((HANDLE)event);
 }
 
 int  os_sem_init(os_sem_t **sem, int value)
@@ -123,23 +124,20 @@ int  os_sem_init(os_sem_t **sem, int value)
 	if (!handle)
 		return -1;
 
-	*sem = bzalloc(sizeof(struct os_sem_data));
-	(*sem)->handle = handle;
+	*sem = (os_sem_t*)handle;
 	return 0;
 }
 
 void os_sem_destroy(os_sem_t *sem)
 {
-	if (sem) {
-		CloseHandle(sem->handle);
-		bfree(sem);
-	}
+	if (sem)
+		CloseHandle((HANDLE)sem);
 }
 
 int  os_sem_post(os_sem_t *sem)
 {
 	if (!sem) return -1;
-	return ReleaseSemaphore(sem->handle, 1, NULL) ? 0 : -1;
+	return ReleaseSemaphore((HANDLE)sem, 1, NULL) ? 0 : -1;
 }
 
 int  os_sem_wait(os_sem_t *sem)
@@ -147,7 +145,7 @@ int  os_sem_wait(os_sem_t *sem)
 	DWORD ret;
 
 	if (!sem) return -1;
-	ret = WaitForSingleObject(sem->handle, INFINITE);
+	ret = WaitForSingleObject((HANDLE)sem, INFINITE);
 	return (ret == WAIT_OBJECT_0) ? 0 : -1;
 }
 
@@ -159,6 +157,21 @@ long os_atomic_inc_long(volatile long *val)
 long os_atomic_dec_long(volatile long *val)
 {
 	return InterlockedDecrement(val);
+}
+
+bool os_atomic_compare_swap_long(volatile long *val, long old_val, long new_val)
+{
+	return InterlockedCompareExchange(val, new_val, old_val) == old_val;
+}
+
+bool os_atomic_set_bool(volatile bool *ptr, bool val)
+{
+	return (bool)InterlockedExchange8((volatile char*)ptr, (char)val);
+}
+
+bool os_atomic_load_bool(const volatile bool *ptr)
+{
+	return (bool)InterlockedOr8((volatile char*)ptr, 0);
 }
 
 #define VC_EXCEPTION 0x406D1388
@@ -177,15 +190,27 @@ struct vs_threadname_info {
 
 void os_set_thread_name(const char *name)
 {
+#ifdef __MINGW32__
+	UNUSED_PARAMETER(name);
+#else
 	struct vs_threadname_info info;
 	info.type = 0x1000;
 	info.name = name;
 	info.thread_id = GetCurrentThreadId();
 	info.flags = 0;
 
+#ifdef NO_SEH_MINGW
+	__try1(EXCEPTION_EXECUTE_HANDLER) {
+#else
 	__try {
+#endif
 		RaiseException(VC_EXCEPTION, 0, THREADNAME_INFO_SIZE,
 				(ULONG_PTR*)&info);
+#ifdef NO_SEH_MINGW
+	} __except1 {
+#else
 	} __except(EXCEPTION_EXECUTE_HANDLER) {
+#endif
 	}
+#endif
 }

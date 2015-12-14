@@ -2,12 +2,20 @@ project(libobs)
 
 find_package(Threads REQUIRED)
 
-find_package(FFMpeg REQUIRED
+find_package(FFmpeg REQUIRED
 	COMPONENTS avformat avutil swscale swresample
 	OPTIONAL_COMPONENTS avcodec)
 include_directories(${FFMPEG_INCLUDE_DIRS})
 
-list(REMOVE_ITEM FFMPEG_LIBRARIES ${FFMPEG_AVCODEC_LIBRARIES})
+if (NOT "${FFMPEG_AVCODEC_LIBRARIES}" STREQUAL "")
+	list(REMOVE_ITEM FFMPEG_LIBRARIES ${FFMPEG_AVCODEC_LIBRARIES})
+endif()
+
+if(UNIX)
+	find_package(DBus QUIET)
+else()
+	set(HAVE_DBUS "0")
+endif()
 
 find_package(ImageMagick QUIET COMPONENTS MagickCore)
 
@@ -35,6 +43,10 @@ else()
 		${FFMPEG_AVCODEC_LIBRARIES})
 endif()
 
+find_package(ZLIB REQUIRED)
+
+include_directories(SYSTEM ${ZLIB_INCLUDE_DIR})
+
 add_definitions(-DLIBOBS_EXPORTS)
 
 include_directories(${OBS_JANSSON_INCLUDE_DIRS})
@@ -46,9 +58,12 @@ if(WIN32)
 		util/threading-windows.c
 		util/pipe-windows.c
 		util/platform-windows.c)
-	set(libobs_PLATFORM_DEPS
-		w32-pthreads
-		winmm.lib)
+	set(libobs_PLATFORM_DEPS winmm)
+	if(MSVC)
+		set(libobs_PLATFORM_DEPS
+		${libobs_PLATFORM_DEPS}
+		w32-pthreads)
+	endif()
 elseif(APPLE)
 	set(libobs_PLATFORM_SOURCES
 		obs-cocoa.c
@@ -56,6 +71,12 @@ elseif(APPLE)
 		util/pipe-posix.c
 		util/platform-nix.c
 		util/platform-cocoa.m)
+	set(libobs_PLATFORM_HEADERS
+		util/windows/win-version.h
+		util/windows/ComPtr.hpp
+		util/windows/CoTaskMemPtr.hpp
+		util/windows/HRError.hpp
+		util/windows/WinHandle.hpp)
 
 	set_source_files_properties(${libobs_PLATFORM_SOURCES}
 		PROPERTIES
@@ -66,14 +87,47 @@ elseif(APPLE)
 	mark_as_advanced(COCOA)
 	include_directories(${COCOA})
 
+	find_library(APPKIT AppKit)
+	mark_as_advanced(APPKIT)
+	include_directories(${APPKIT})
+
+	find_library(IOKIT IOKit)
+	mark_as_advanced(IOKIT)
+	include_directories(${IOKIT})
+
+	find_library(CARBON Carbon)
+	mark_as_advanced(CARBON)
+	include_directories(${CARBON})
+
 	set(libobs_PLATFORM_DEPS
-		${COCOA})
+		${COCOA}
+		${APPKIT}
+		${IOKIT}
+		${CARBON})
 elseif(UNIX)
 	set(libobs_PLATFORM_SOURCES
 		obs-nix.c
 		util/threading-posix.c
 		util/pipe-posix.c
 		util/platform-nix.c)
+
+	if(DBUS_FOUND)
+		set(libobs_PLATFORM_SOURCES ${libobs_PLATFORM_SOURCES}
+			util/platform-nix-dbus.c)
+		include_directories(${DBUS_INCLUDE_DIRS})
+		set(libobs_PLATFORM_DEPS
+			${libobs_PLATFORM_DEPS}
+			${DBUS_LIBRARIES})
+	endif()
+
+	if(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
+		# use the sysinfo compatibility library on bsd
+		find_package(Libsysinfo REQUIRED)
+		include_directories(${SYSINFO_INCLUDE_DIRS})
+		set(libobs_PLATFORM_DEPS
+			${libobs_PLATFORM_DEPS}
+			${SYSINFO_LIBRARIES})
+	endif()
 endif()
 
 if(MSVC)
@@ -153,14 +207,17 @@ set(libobs_mediaio_HEADERS
 	media-io/media-io-defs.h
 	media-io/video-io.h
 	media-io/audio-io.h
+	media-io/audio-math.h
 	media-io/video-frame.h
 	media-io/format-conversion.h
 	media-io/audio-resampler.h
 	media-io/video-scaler.h
-	media-io/media-remux.h)
+	media-io/media-remux.h
+	media-io/frame-rate.h)
 
 set(libobs_util_SOURCES
 	util/array-serializer.c
+	util/file-serializer.c
 	util/base.c
 	util/platform.c
 	util/cf-lexer.c
@@ -169,11 +226,15 @@ set(libobs_util_SOURCES
 	util/lexer.c
 	util/dstr.c
 	util/utf8.c
+	util/crc32.c
 	util/text-lookup.c
-	util/cf-parser.c)
+	util/cf-parser.c
+	util/profiler.c)
 set(libobs_util_HEADERS
 	util/array-serializer.h
+	util/file-serializer.h
 	util/utf8.h
+	util/crc32.h
 	util/base.h
 	util/text-lookup.h
 	util/vc/vc_inttypes.h
@@ -191,7 +252,9 @@ set(libobs_util_HEADERS
 	util/serializer.h
 	util/config-file.h
 	util/lexer.h
-	util/platform.h)
+	util/platform.h
+	util/profiler.h
+	util/profiler.hpp)
 
 set(libobs_libobs_SOURCES
 	${libobs_PLATFORM_SOURCES}
@@ -201,15 +264,19 @@ set(libobs_libobs_SOURCES
 	obs-service.c
 	obs-source.c
 	obs-output.c
+	obs-output-delay.c
 	obs.c
 	obs-properties.c
 	obs-data.c
+	obs-hotkey.c
+	obs-hotkey-name-map.c
 	obs-module.c
 	obs-display.c
 	obs-view.c
 	obs-scene.c
 	obs-video.c)
 set(libobs_libobs_HEADERS
+	${libobs_PLATFORM_HEADERS}
 	obs-audio-controls.h
 	obs-defs.h
 	obs-avc.h
@@ -221,6 +288,8 @@ set(libobs_libobs_HEADERS
 	obs-properties.h
 	obs-data.h
 	obs-interaction.h
+	obs-hotkey.h
+	obs-hotkeys.h
 	obs-module.h
 	obs-scene.h
 	obs-source.h
@@ -288,6 +357,7 @@ target_link_libraries(libobs
 		${libobs_image_loading_LIBRARIES}
 		${OBS_JANSSON_IMPORT}
 		${FFMPEG_LIBRARIES}
+		${ZLIB_LIBRARIES}
 	PUBLIC
 		${THREADS_LIBRARIES})
 

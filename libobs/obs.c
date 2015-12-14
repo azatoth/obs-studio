@@ -28,18 +28,6 @@ struct obs_core *obs = NULL;
 extern void add_default_module_paths(void);
 extern char *find_libobs_data_file(const char *file);
 
-static inline void make_gs_init_data(struct gs_init_data *gid,
-		const struct obs_video_info *ovi)
-{
-	memcpy(&gid->window, &ovi->window, sizeof(struct gs_window));
-	gid->cx              = ovi->window_width;
-	gid->cy              = ovi->window_height;
-	gid->num_backbuffers = 2;
-	gid->format          = GS_RGBA;
-	gid->zsformat        = GS_ZS_NONE;
-	gid->adapter         = ovi->adapter;
-}
-
 static inline void make_video_info(struct video_output_info *vi,
 		struct obs_video_info *ovi)
 {
@@ -118,6 +106,37 @@ static inline void set_nv12_sizes(const struct obs_video_info *ovi)
 	video->conversion_tech = "NV12";
 }
 
+static inline void set_444p_sizes(const struct obs_video_info *ovi)
+{
+	struct obs_core_video *video = &obs->video;
+	uint32_t chroma_pixels;
+	uint32_t total_bytes;
+
+	chroma_pixels = (ovi->output_width * ovi->output_height);
+	chroma_pixels = GET_ALIGN(chroma_pixels, PIXEL_SIZE);
+
+	video->plane_offsets[0] = 0;
+	video->plane_offsets[1] = chroma_pixels;
+	video->plane_offsets[2] = chroma_pixels + chroma_pixels;
+
+	video->plane_linewidth[0] = ovi->output_width;
+	video->plane_linewidth[1] = ovi->output_width;
+	video->plane_linewidth[2] = ovi->output_width;
+
+	video->plane_sizes[0] = chroma_pixels;
+	video->plane_sizes[1] = chroma_pixels;
+	video->plane_sizes[2] = chroma_pixels;
+
+	total_bytes = video->plane_offsets[2] + chroma_pixels;
+
+	video->conversion_height =
+		(total_bytes/PIXEL_SIZE + ovi->output_width-1) /
+		ovi->output_width;
+
+	video->conversion_height = GET_ALIGN(video->conversion_height, 2);
+	video->conversion_tech = "Planar444";
+}
+
 static inline void calc_gpu_conversion_sizes(const struct obs_video_info *ovi)
 {
 	obs->video.conversion_height = 0;
@@ -132,6 +151,9 @@ static inline void calc_gpu_conversion_sizes(const struct obs_video_info *ovi)
 		break;
 	case VIDEO_FORMAT_NV12:
 		set_nv12_sizes(ovi);
+		break;
+	case VIDEO_FORMAT_I444:
+		set_444p_sizes(ovi);
 		break;
 	}
 }
@@ -196,14 +218,11 @@ static bool obs_init_textures(struct obs_video_info *ovi)
 static int obs_init_graphics(struct obs_video_info *ovi)
 {
 	struct obs_core_video *video = &obs->video;
-	struct gs_init_data graphics_data;
 	bool success = true;
 	int errorcode;
 
-	make_gs_init_data(&graphics_data, ovi);
-
 	errorcode = gs_create(&video->graphics, ovi->graphics_module,
-			&graphics_data);
+			ovi->adapter);
 	if (errorcode != GS_SUCCESS) {
 		switch (errorcode) {
 		case GS_ERROR_MODULE_NOT_FOUND:
@@ -229,6 +248,11 @@ static int obs_init_graphics(struct obs_video_info *ovi)
 		bfree(filename);
 	}
 
+	filename = find_libobs_data_file("opaque.effect");
+	video->opaque_effect = gs_effect_create_from_file(filename,
+			NULL);
+	bfree(filename);
+
 	filename = find_libobs_data_file("solid.effect");
 	video->solid_effect = gs_effect_create_from_file(filename,
 			NULL);
@@ -249,12 +273,19 @@ static int obs_init_graphics(struct obs_video_info *ovi)
 			NULL);
 	bfree(filename);
 
+	filename = find_libobs_data_file("bilinear_lowres_scale.effect");
+	video->bilinear_lowres_effect = gs_effect_create_from_file(filename,
+			NULL);
+	bfree(filename);
+
 	if (!video->default_effect)
 		success = false;
 	if (gs_get_device_type() == GS_DEVICE_OPENGL) {
 		if (!video->default_rect_effect)
 			success = false;
 	}
+	if (!video->opaque_effect)
+		success = false;
 	if (!video->solid_effect)
 		success = false;
 	if (!video->conversion_effect)
@@ -314,12 +345,6 @@ static int obs_init_video(struct obs_video_info *ovi)
 		return OBS_VIDEO_FAIL;
 	}
 
-	if (!obs_display_init(&video->main_display, NULL))
-		return OBS_VIDEO_FAIL;
-
-	video->main_display.cx = ovi->window_width;
-	video->main_display.cy = ovi->window_height;
-
 	gs_enter_context(video->graphics);
 
 	if (ovi->gpu_conversion && !obs_init_gpu_conversion(ovi))
@@ -358,8 +383,6 @@ static void obs_free_video(void)
 	struct obs_core_video *video = &obs->video;
 
 	if (video->video) {
-		obs_display_free(&video->main_display);
-
 		video_output_close(video->video);
 		video->video = NULL;
 
@@ -411,10 +434,12 @@ static void obs_free_graphics(void)
 
 		gs_effect_destroy(video->default_effect);
 		gs_effect_destroy(video->default_rect_effect);
+		gs_effect_destroy(video->opaque_effect);
 		gs_effect_destroy(video->solid_effect);
 		gs_effect_destroy(video->conversion_effect);
 		gs_effect_destroy(video->bicubic_effect);
 		gs_effect_destroy(video->lanczos_effect);
+		gs_effect_destroy(video->bilinear_lowres_effect);
 		video->default_effect = NULL;
 
 		gs_leave_context();
@@ -489,6 +514,17 @@ fail:
 	return data->valid;
 }
 
+void obs_main_view_free(struct obs_view *view)
+{
+	if (!view) return;
+
+	for (size_t i = 0; i < MAX_CHANNELS; i++)
+		obs_source_release(view->channels[i]);
+
+	memset(view->channels, 0, sizeof(view->channels));
+	pthread_mutex_destroy(&view->channels_mutex);
+}
+
 #define FREE_OBS_LINKED_LIST(type) \
 	do { \
 		int unfreed = 0; \
@@ -507,7 +543,7 @@ static void obs_free_data(void)
 
 	data->valid = false;
 
-	obs_view_free(&data->main_view);
+	obs_main_view_free(&data->main_view);
 
 	blog(LOG_INFO, "Freeing OBS context data");
 
@@ -550,6 +586,11 @@ static const char *obs_signals[] = {
 	"void channel_change(int channel, in out ptr source, ptr prev_source)",
 	"void master_volume(in out float volume)",
 
+	"void hotkey_layout_change()",
+	"void hotkey_register(ptr hotkey)",
+	"void hotkey_unregister(ptr hotkey)",
+	"void hotkey_bindings_changed(ptr hotkey)",
+
 	NULL
 };
 
@@ -566,13 +607,97 @@ static inline bool obs_init_handlers(void)
 	return signal_handler_add_array(obs->signals, obs_signals);
 }
 
+static pthread_once_t obs_pthread_once_init_token = PTHREAD_ONCE_INIT;
+static inline bool obs_init_hotkeys(void)
+{
+	struct obs_core_hotkeys *hotkeys = &obs->hotkeys;
+	pthread_mutexattr_t attr;
+	bool success = false;
+
+	assert(hotkeys != NULL);
+
+	da_init(hotkeys->hotkeys);
+	hotkeys->signals = obs->signals;
+	hotkeys->name_map_init_token = obs_pthread_once_init_token;
+	hotkeys->mute = bstrdup("Mute");
+	hotkeys->unmute = bstrdup("Unmute");
+	hotkeys->push_to_mute = bstrdup("Push-to-mute");
+	hotkeys->push_to_talk = bstrdup("Push-to-talk");
+	hotkeys->sceneitem_show = bstrdup("Show '%1'");
+	hotkeys->sceneitem_hide = bstrdup("Hide '%1'");
+
+	if (!obs_hotkeys_platform_init(hotkeys))
+		return false;
+
+	if (pthread_mutexattr_init(&attr) != 0)
+		return false;
+	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
+		goto fail;
+	if (pthread_mutex_init(&hotkeys->mutex, &attr) != 0)
+		goto fail;
+
+	if (os_event_init(&hotkeys->stop_event, OS_EVENT_TYPE_MANUAL) != 0)
+		goto fail;
+	if (pthread_create(&hotkeys->hotkey_thread, NULL,
+			obs_hotkey_thread, NULL))
+		goto fail;
+
+	hotkeys->hotkey_thread_initialized = true;
+
+	success = true;
+
+fail:
+	pthread_mutexattr_destroy(&attr);
+	return success;
+}
+
+static inline void stop_hotkeys(void)
+{
+	struct obs_core_hotkeys *hotkeys = &obs->hotkeys;
+	void *thread_ret;
+
+	if (hotkeys->hotkey_thread_initialized) {
+		os_event_signal(hotkeys->stop_event);
+		pthread_join(hotkeys->hotkey_thread, &thread_ret);
+		hotkeys->hotkey_thread_initialized = false;
+	}
+
+	os_event_destroy(hotkeys->stop_event);
+	obs_hotkeys_free();
+}
+
+static inline void obs_free_hotkeys(void)
+{
+	struct obs_core_hotkeys *hotkeys = &obs->hotkeys;
+
+	bfree(hotkeys->mute);
+	bfree(hotkeys->unmute);
+	bfree(hotkeys->push_to_mute);
+	bfree(hotkeys->push_to_talk);
+	bfree(hotkeys->sceneitem_show);
+	bfree(hotkeys->sceneitem_hide);
+
+	obs_hotkey_name_map_free();
+
+	obs_hotkeys_platform_free(hotkeys);
+	pthread_mutex_destroy(&hotkeys->mutex);
+}
+
 extern const struct obs_source_info scene_info;
 
 extern void log_system_info(void);
 
-static bool obs_init(const char *locale)
+static bool obs_init(const char *locale, const char *module_config_path,
+		profiler_name_store_t *store)
 {
 	obs = bzalloc(sizeof(struct obs_core));
+
+	obs->name_store_owned = !store;
+	obs->name_store = store ? store : profiler_name_store_create();
+	if (!obs->name_store) {
+		blog(LOG_ERROR, "Couldn't create profiler name store");
+		return false;
+	}
 
 	log_system_info();
 
@@ -580,7 +705,11 @@ static bool obs_init(const char *locale)
 		return false;
 	if (!obs_init_handlers())
 		return false;
+	if (!obs_init_hotkeys())
+		return false;
 
+	if (module_config_path)
+		obs->module_config_path = bstrdup(module_config_path);
 	obs->locale = bstrdup(locale);
 	obs_register_source(&scene_info);
 	add_default_module_paths();
@@ -589,11 +718,17 @@ static bool obs_init(const char *locale)
 
 #ifdef _WIN32
 extern void initialize_crash_handler(void);
+extern void initialize_com(void);
+extern void uninitialize_com(void);
 #endif
 
-bool obs_startup(const char *locale)
+static const char *obs_startup_name = "obs_startup";
+bool obs_startup(const char *locale, const char *module_config_path,
+		profiler_name_store_t *store)
 {
 	bool success;
+
+	profile_start(obs_startup_name);
 
 	if (obs) {
 		blog(LOG_WARNING, "Tried to call obs_startup more than once");
@@ -602,9 +737,11 @@ bool obs_startup(const char *locale)
 
 #ifdef _WIN32
 	initialize_crash_handler();
+	initialize_com();
 #endif
 
-	success = obs_init(locale);
+	success = obs_init(locale, module_config_path, store);
+	profile_end(obs_startup_name);
 	if (!success)
 		obs_shutdown();
 
@@ -618,19 +755,33 @@ void obs_shutdown(void)
 	if (!obs)
 		return;
 
-	da_free(obs->input_types);
-	da_free(obs->filter_types);
-	da_free(obs->encoder_types);
-	da_free(obs->transition_types);
-	da_free(obs->output_types);
-	da_free(obs->service_types);
-	da_free(obs->modal_ui_callbacks);
-	da_free(obs->modeless_ui_callbacks);
+#define FREE_REGISTERED_TYPES(structure, list) \
+	do { \
+		for (size_t i = 0; i < list.num; i++) { \
+			struct structure *item = &list.array[i]; \
+			if (item->type_data && item->free_type_data) \
+				item->free_type_data(item->type_data); \
+		} \
+		da_free(list); \
+	} while (false)
+
+	FREE_REGISTERED_TYPES(obs_source_info, obs->input_types);
+	FREE_REGISTERED_TYPES(obs_source_info, obs->filter_types);
+	FREE_REGISTERED_TYPES(obs_source_info, obs->transition_types);
+	FREE_REGISTERED_TYPES(obs_output_info, obs->output_types);
+	FREE_REGISTERED_TYPES(obs_encoder_info, obs->encoder_types);
+	FREE_REGISTERED_TYPES(obs_service_info, obs->service_types);
+	FREE_REGISTERED_TYPES(obs_modal_ui, obs->modal_ui_callbacks);
+	FREE_REGISTERED_TYPES(obs_modeless_ui, obs->modeless_ui_callbacks);
+
+#undef FREE_REGISTERED_TYPES
 
 	stop_video();
+	stop_hotkeys();
 
 	obs_free_data();
 	obs_free_video();
+	obs_free_hotkeys();
 	obs_free_graphics();
 	obs_free_audio();
 	proc_handler_destroy(obs->procs);
@@ -648,9 +799,17 @@ void obs_shutdown(void)
 		free_module_path(obs->module_paths.array+i);
 	da_free(obs->module_paths);
 
+	if (obs->name_store_owned)
+		profiler_name_store_free(obs->name_store);
+
+	bfree(obs->module_config_path);
 	bfree(obs->locale);
 	bfree(obs);
 	obs = NULL;
+
+#ifdef _WIN32
+	uninitialize_com();
+#endif
 }
 
 bool obs_initialized(void)
@@ -730,19 +889,24 @@ int obs_reset_video(struct obs_video_info *ovi)
 		}
 	}
 
+	blog(LOG_INFO, "---------------------------------");
 	blog(LOG_INFO, "video settings reset:\n"
 	               "\tbase resolution:   %dx%d\n"
 	               "\toutput resolution: %dx%d\n"
-	               "\tfps:               %d/%d",
+	               "\tfps:               %d/%d\n"
+	               "\tformat:            %s",
 	               ovi->base_width, ovi->base_height,
 	               ovi->output_width, ovi->output_height,
-	               ovi->fps_num, ovi->fps_den);
+	               ovi->fps_num, ovi->fps_den,
+		       get_video_format_name(ovi->output_format));
 
 	return obs_init_video(ovi);
 }
 
-bool obs_reset_audio(struct audio_output_info *ai)
+bool obs_reset_audio(const struct obs_audio_info *oai)
 {
+	struct audio_output_info ai;
+
 	if (!obs) return false;
 
 	/* don't allow changing of audio settings if active. */
@@ -750,18 +914,25 @@ bool obs_reset_audio(struct audio_output_info *ai)
 		return false;
 
 	obs_free_audio();
-	if(!ai)
+	if (!oai)
 		return true;
 
+	ai.name = "Audio";
+	ai.samples_per_sec = oai->samples_per_sec;
+	ai.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	ai.speakers = oai->speakers;
+	ai.buffer_ms = oai->buffer_ms;
+
+	blog(LOG_INFO, "---------------------------------");
 	blog(LOG_INFO, "audio settings reset:\n"
 	               "\tsamples per sec: %d\n"
 	               "\tspeakers:        %d\n"
-	               "\tbuffering (ms):  %d\n",
-	               (int)ai->samples_per_sec,
-	               (int)ai->speakers,
-	               (int)ai->buffer_ms);
+	               "\tbuffering (ms):  %d",
+	               (int)ai.samples_per_sec,
+	               (int)ai.speakers,
+	               (int)ai.buffer_ms);
 
-	return obs_init_audio(ai);
+	return obs_init_audio(&ai);
 }
 
 bool obs_get_video_info(struct obs_video_info *ovi)
@@ -792,17 +963,19 @@ bool obs_get_video_info(struct obs_video_info *ovi)
 	return true;
 }
 
-bool obs_get_audio_info(struct audio_output_info *aoi)
+bool obs_get_audio_info(struct obs_audio_info *oai)
 {
 	struct obs_core_audio *audio = &obs->audio;
 	const struct audio_output_info *info;
 
-	if (!obs || !audio->audio)
+	if (!obs || !oai || !audio->audio)
 		return false;
 
 	info = audio_output_get_info(audio->audio);
-	memcpy(aoi, info, sizeof(struct audio_output_info));
 
+	oai->samples_per_sec = info->samples_per_sec;
+	oai->speakers = info->speakers;
+	oai->buffer_ms = info->buffer_ms;
 	return true;
 }
 
@@ -1018,8 +1191,17 @@ void obs_enum_sources(bool (*enum_proc)(void*, obs_source_t*), void *param)
 
 	for (size_t i = 0; i < obs->data.user_sources.num; i++) {
 		struct obs_source *source = obs->data.user_sources.array[i];
+		size_t prev_size = obs->data.user_sources.num;
+
 		if (!enum_proc(param, source))
 			break;
+
+		/* To ensure the save data is always consistent, we always want
+		 * to traverse this list forward.  Because of that, we have to
+		 * manually check to see if the source was removed in the
+		 * enumeration proc and adjust it accordingly */
+		if (obs->data.user_sources.num < prev_size)
+			i--;
 	}
 
 	pthread_mutex_unlock(&obs->data.user_sources_mutex);
@@ -1093,7 +1275,7 @@ obs_source_t *obs_get_source_by_name(const char *name)
 }
 
 static inline void *get_context_by_name(void *vfirst, const char *name,
-		pthread_mutex_t *mutex)
+		pthread_mutex_t *mutex, void *(*addref)(void*))
 {
 	struct obs_context_data **first = vfirst;
 	struct obs_context_data *context;
@@ -1102,8 +1284,10 @@ static inline void *get_context_by_name(void *vfirst, const char *name,
 
 	context = *first;
 	while (context) {
-		if (strcmp(context->name, name) == 0)
+		if (strcmp(context->name, name) == 0) {
+			context = addref(context);
 			break;
+		}
 		context = context->next;
 	}
 
@@ -1111,43 +1295,76 @@ static inline void *get_context_by_name(void *vfirst, const char *name,
 	return context;
 }
 
+static inline void *obs_output_addref_safe_(void *ref)
+{
+	return obs_output_get_ref(ref);
+}
+
+static inline void *obs_encoder_addref_safe_(void *ref)
+{
+	return obs_encoder_get_ref(ref);
+}
+
+static inline void *obs_service_addref_safe_(void *ref)
+{
+	return obs_service_get_ref(ref);
+}
+
+static inline void *obs_id_(void *data)
+{
+	return data;
+}
+
 obs_output_t *obs_get_output_by_name(const char *name)
 {
 	if (!obs) return NULL;
 	return get_context_by_name(&obs->data.first_output, name,
-			&obs->data.outputs_mutex);
+			&obs->data.outputs_mutex, obs_output_addref_safe_);
 }
 
 obs_encoder_t *obs_get_encoder_by_name(const char *name)
 {
 	if (!obs) return NULL;
 	return get_context_by_name(&obs->data.first_encoder, name,
-			&obs->data.encoders_mutex);
+			&obs->data.encoders_mutex, obs_encoder_addref_safe_);
 }
 
 obs_service_t *obs_get_service_by_name(const char *name)
 {
 	if (!obs) return NULL;
 	return get_context_by_name(&obs->data.first_service, name,
-			&obs->data.services_mutex);
+			&obs->data.services_mutex, obs_service_addref_safe_);
 }
 
-gs_effect_t *obs_get_default_effect(void)
+gs_effect_t *obs_get_base_effect(enum obs_base_effect effect)
 {
 	if (!obs) return NULL;
-	return obs->video.default_effect;
+
+	switch (effect) {
+	case OBS_EFFECT_DEFAULT:
+		return obs->video.default_effect;
+	case OBS_EFFECT_DEFAULT_RECT:
+		return obs->video.default_rect_effect;
+	case OBS_EFFECT_OPAQUE:
+		return obs->video.opaque_effect;
+	case OBS_EFFECT_SOLID:
+		return obs->video.solid_effect;
+	case OBS_EFFECT_BICUBIC:
+		return obs->video.bicubic_effect;
+	case OBS_EFFECT_LANCZOS:
+		return obs->video.lanczos_effect;
+	case OBS_EFFECT_BILINEAR_LOWRES:
+		return obs->video.bilinear_lowres_effect;
+	}
+
+	return NULL;
 }
 
+/* DEPRECATED */
 gs_effect_t *obs_get_default_rect_effect(void)
 {
 	if (!obs) return NULL;
 	return obs->video.default_rect_effect;
-}
-
-gs_effect_t *obs_get_solid_effect(void)
-{
-	if (!obs) return NULL;
-	return obs->video.solid_effect;
 }
 
 signal_handler_t *obs_get_signal_handler(void)
@@ -1160,30 +1377,6 @@ proc_handler_t *obs_get_proc_handler(void)
 {
 	if (!obs) return NULL;
 	return obs->procs;
-}
-
-void obs_add_draw_callback(
-		void (*draw)(void *param, uint32_t cx, uint32_t cy),
-		void *param)
-{
-	if (!obs) return;
-
-	obs_display_add_draw_callback(&obs->video.main_display, draw, param);
-}
-
-void obs_remove_draw_callback(
-		void (*draw)(void *param, uint32_t cx, uint32_t cy),
-		void *param)
-{
-	if (!obs) return;
-
-	obs_display_remove_draw_callback(&obs->video.main_display, draw, param);
-}
-
-void obs_resize(uint32_t cx, uint32_t cy)
-{
-	if (!obs || !obs->video.video || !obs->video.graphics) return;
-	obs_display_resize(&obs->video.main_display, cx, cy);
 }
 
 void obs_render_main_view(void)
@@ -1222,17 +1415,23 @@ float obs_get_present_volume(void)
 	return obs ? obs->audio.present_volume : 0.0f;
 }
 
-obs_source_t *obs_load_source(obs_data_t *source_data)
+static obs_source_t *obs_load_source_type(obs_data_t *source_data,
+		enum obs_source_type type)
 {
+	obs_data_array_t *filters = obs_data_get_array(source_data, "filters");
 	obs_source_t *source;
 	const char   *name    = obs_data_get_string(source_data, "name");
 	const char   *id      = obs_data_get_string(source_data, "id");
 	obs_data_t   *settings = obs_data_get_obj(source_data, "settings");
+	obs_data_t   *hotkeys  = obs_data_get_obj(source_data, "hotkeys");
 	double       volume;
 	int64_t      sync;
 	uint32_t     flags;
+	uint32_t     mixers;
 
-	source = obs_source_create(OBS_SOURCE_TYPE_INPUT, id, name, settings);
+	source = obs_source_create(type, id, name, settings, hotkeys);
+
+	obs_data_release(hotkeys);
 
 	obs_data_set_default_double(source_data, "volume", 1.0);
 	volume = obs_data_get_double(source_data, "volume");
@@ -1241,13 +1440,65 @@ obs_source_t *obs_load_source(obs_data_t *source_data)
 	sync = obs_data_get_int(source_data, "sync");
 	obs_source_set_sync_offset(source, sync);
 
+	obs_data_set_default_int(source_data, "mixers", 0xF);
+	mixers = (uint32_t)obs_data_get_int(source_data, "mixers");
+	obs_source_set_audio_mixers(source, mixers);
+
 	obs_data_set_default_int(source_data, "flags", source->default_flags);
 	flags = (uint32_t)obs_data_get_int(source_data, "flags");
 	obs_source_set_flags(source, flags);
 
+	obs_data_set_default_bool(source_data, "enabled", true);
+	obs_source_set_enabled(source,
+			obs_data_get_bool(source_data, "enabled"));
+
+	obs_data_set_default_bool(source_data, "muted", false);
+	obs_source_set_muted(source, obs_data_get_bool(source_data, "muted"));
+
+	obs_data_set_default_bool(source_data, "push-to-mute", false);
+	obs_source_enable_push_to_mute(source,
+			obs_data_get_bool(source_data, "push-to-mute"));
+
+	obs_data_set_default_int(source_data, "push-to-mute-delay", 0);
+	obs_source_set_push_to_mute_delay(source,
+			obs_data_get_int(source_data, "push-to-mute-delay"));
+
+	obs_data_set_default_bool(source_data, "push-to-talk", false);
+	obs_source_enable_push_to_talk(source,
+			obs_data_get_bool(source_data, "push-to-talk"));
+
+	obs_data_set_default_int(source_data, "push-to-talk-delay", 0);
+	obs_source_set_push_to_talk_delay(source,
+			obs_data_get_int(source_data, "push-to-talk-delay"));
+
+	if (filters) {
+		size_t count = obs_data_array_count(filters);
+
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *filter_data =
+				obs_data_array_item(filters, i);
+
+			obs_source_t *filter = obs_load_source_type(
+					filter_data, OBS_SOURCE_TYPE_FILTER);
+			if (filter) {
+				obs_source_filter_add(source, filter);
+				obs_source_release(filter);
+			}
+
+			obs_data_release(filter_data);
+		}
+
+		obs_data_array_release(filters);
+	}
+
 	obs_data_release(settings);
 
 	return source;
+}
+
+obs_source_t *obs_load_source(obs_data_t *source_data)
+{
+	return obs_load_source_type(source_data, OBS_SOURCE_TYPE_INPUT);
 }
 
 void obs_load_sources(obs_data_array_t *array)
@@ -1280,24 +1531,65 @@ void obs_load_sources(obs_data_array_t *array)
 
 obs_data_t *obs_save_source(obs_source_t *source)
 {
+	obs_data_array_t *filters = obs_data_array_create();
 	obs_data_t *source_data = obs_data_create();
 	obs_data_t *settings    = obs_source_get_settings(source);
+	obs_data_t *hotkey_data = source->context.hotkey_data;
+	obs_data_t *hotkeys;
 	float      volume      = obs_source_get_volume(source);
+	uint32_t   mixers      = obs_source_get_audio_mixers(source);
 	int64_t    sync        = obs_source_get_sync_offset(source);
 	uint32_t   flags       = obs_source_get_flags(source);
 	const char *name       = obs_source_get_name(source);
 	const char *id         = obs_source_get_id(source);
+	bool       enabled     = obs_source_enabled(source);
+	bool       muted       = obs_source_muted(source);
+	bool       push_to_mute= obs_source_push_to_mute_enabled(source);
+	uint64_t   ptm_delay   = obs_source_get_push_to_mute_delay(source);
+	bool       push_to_talk= obs_source_push_to_talk_enabled(source);
+	uint64_t   ptt_delay   = obs_source_get_push_to_talk_delay(source);
 
 	obs_source_save(source);
+	hotkeys = obs_hotkeys_save_source(source);
+
+	if (hotkeys) {
+		obs_data_release(hotkey_data);
+		source->context.hotkey_data = hotkeys;
+		hotkey_data = hotkeys;
+	}
 
 	obs_data_set_string(source_data, "name",     name);
 	obs_data_set_string(source_data, "id",       id);
 	obs_data_set_obj   (source_data, "settings", settings);
+	obs_data_set_int   (source_data, "mixers",   mixers);
 	obs_data_set_int   (source_data, "sync",     sync);
 	obs_data_set_int   (source_data, "flags",    flags);
 	obs_data_set_double(source_data, "volume",   volume);
+	obs_data_set_bool  (source_data, "enabled",  enabled);
+	obs_data_set_bool  (source_data, "muted",    muted);
+	obs_data_set_bool  (source_data, "push-to-mute", push_to_mute);
+	obs_data_set_int   (source_data, "push-to-mute-delay", ptm_delay);
+	obs_data_set_bool  (source_data, "push-to-talk", push_to_talk);
+	obs_data_set_int   (source_data, "push-to-talk-delay", ptt_delay);
+	obs_data_set_obj   (source_data, "hotkeys",  hotkey_data);
+
+	pthread_mutex_lock(&source->filter_mutex);
+
+	if (source->filters.num) {
+		for (size_t i = source->filters.num; i > 0; i--) {
+			obs_source_t *filter = source->filters.array[i - 1];
+			obs_data_t *filter_data = obs_save_source(filter);
+			obs_data_array_push_back(filters, filter_data);
+			obs_data_release(filter_data);
+		}
+
+		obs_data_set_array(source_data, "filters", filters);
+	}
+
+	pthread_mutex_unlock(&source->filter_mutex);
 
 	obs_data_release(settings);
+	obs_data_array_release(filters);
 
 	return source_data;
 }
@@ -1331,7 +1623,7 @@ static inline char *dup_name(const char *name)
 {
 	if (!name || !*name) {
 		struct dstr unnamed = {0};
-		dstr_printf(&unnamed, "__unnamed%004lld",
+		dstr_printf(&unnamed, "__unnamed%04lld",
 				obs->data.unnamed_index++);
 
 		return unnamed.array;
@@ -1343,7 +1635,8 @@ static inline char *dup_name(const char *name)
 static inline bool obs_context_data_init_wrap(
 		struct obs_context_data *context,
 		obs_data_t              *settings,
-		const char              *name)
+		const char              *name,
+		obs_data_t              *hotkey_data)
 {
 	assert(context);
 	memset(context, 0, sizeof(*context));
@@ -1360,17 +1653,19 @@ static inline bool obs_context_data_init_wrap(
 	if (!context->procs)
 		return false;
 
-	context->name     = dup_name(name);
-	context->settings = obs_data_newref(settings);
+	context->name        = dup_name(name);
+	context->settings    = obs_data_newref(settings);
+	context->hotkey_data = obs_data_newref(hotkey_data);
 	return true;
 }
 
 bool obs_context_data_init(
 		struct obs_context_data *context,
 		obs_data_t              *settings,
-		const char              *name)
+		const char              *name,
+		obs_data_t              *hotkey_data)
 {
-	if (obs_context_data_init_wrap(context, settings, name)) {
+	if (obs_context_data_init_wrap(context, settings, name, hotkey_data)) {
 		return true;
 	} else {
 		obs_context_data_free(context);
@@ -1380,6 +1675,7 @@ bool obs_context_data_init(
 
 void obs_context_data_free(struct obs_context_data *context)
 {
+	obs_hotkeys_context_release(context);
 	signal_handler_destroy(context->signals);
 	proc_handler_destroy(context->procs);
 	obs_data_release(context->settings);
@@ -1438,4 +1734,12 @@ void obs_context_data_setname(struct obs_context_data *context,
 	context->name = dup_name(name);
 
 	pthread_mutex_unlock(&context->rename_cache_mutex);
+}
+
+profiler_name_store_t *obs_get_profiler_name_store(void)
+{
+	if (!obs)
+		return NULL;
+
+	return obs->name_store;
 }

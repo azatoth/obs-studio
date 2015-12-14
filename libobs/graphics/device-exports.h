@@ -29,7 +29,7 @@ EXPORT bool device_enum_adapters(
 		bool (*callback)(void *param, const char *name, uint32_t id),
 		void *param);
 EXPORT const char *device_preprocessor_name(void);
-EXPORT int device_create(gs_device_t **device, const struct gs_init_data *data);
+EXPORT int device_create(gs_device_t **device, uint32_t adapter);
 EXPORT void device_destroy(gs_device_t *device);
 EXPORT void device_enter_context(gs_device_t *device);
 EXPORT void device_leave_context(gs_device_t *device);
@@ -121,6 +121,9 @@ EXPORT void device_enable_color(gs_device_t *device, bool red, bool green,
 		bool blue, bool alpha);
 EXPORT void device_blend_function(gs_device_t *device, enum gs_blend_type src,
 		enum gs_blend_type dest);
+EXPORT void device_blend_function_separate(gs_device_t *device,
+		enum gs_blend_type src_c, enum gs_blend_type dest_c,
+		enum gs_blend_type src_a, enum gs_blend_type dest_a);
 EXPORT void device_depth_function(gs_device_t *device, enum gs_depth_test test);
 EXPORT void device_stencil_function(gs_device_t *device,
 		enum gs_stencil_side side, enum gs_depth_test test);

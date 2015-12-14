@@ -113,7 +113,9 @@ static bool find_device_id_by_uid(struct coreaudio_data *ca)
 		success = coreaudio_get_device_id(cf_uid, &ca->device_id);
 	}
 
-	CFRelease(cf_uid);
+	if (cf_uid)
+		CFRelease(cf_uid);
+
 	return success;
 }
 
@@ -202,6 +204,16 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 			SCOPE_INPUT, BUS_INPUT, &desc, &size);
 	if (!ca_success(stat, ca, "coreaudio_init_format", "get input format"))
 		return false;
+
+	/* Certain types of devices have no limit on channel count, and
+	 * there's no way to know the actual number of channels it's using,
+	 * so if we encounter this situation just force to stereo */
+        if (desc.mChannelsPerFrame > 8) {
+                desc.mChannelsPerFrame = 2;
+                desc.mBytesPerFrame = 2 * desc.mBitsPerChannel / 8;
+                desc.mBytesPerPacket =
+                        desc.mFramesPerPacket * desc.mBytesPerFrame;
+        }
 
 	stat = set_property(ca->unit, kAudioUnitProperty_StreamFormat,
 			SCOPE_OUTPUT, BUS_INPUT, &desc, size);
@@ -492,7 +504,9 @@ static bool coreaudio_get_device_name(struct coreaudio_data *ca)
 	bfree(ca->device_name);
 	ca->device_name = bstrdup(name);
 
-	CFRelease(cf_name);
+	if (cf_name)
+		CFRelease(cf_name);
+
 	return true;
 }
 
@@ -633,14 +647,30 @@ static void coreaudio_uninit(struct coreaudio_data *ca)
 
 /* ------------------------------------------------------------------------- */
 
-static const char *coreaudio_input_getname(void)
+static const char *coreaudio_input_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return TEXT_AUDIO_INPUT;
 }
 
-static const char *coreaudio_output_getname(void)
+static const char *coreaudio_output_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return TEXT_AUDIO_OUTPUT;
+}
+
+static void coreaudio_shutdown(struct coreaudio_data *ca)
+{
+	if (ca->reconnecting) {
+		os_event_signal(ca->exit_event);
+		pthread_join(ca->reconnect_thread, NULL);
+		os_event_reset(ca->exit_event);
+	}
+
+	coreaudio_uninit(ca);
+
+	if (ca->unit)
+		AudioComponentInstanceDispose(ca->unit);
 }
 
 static void coreaudio_destroy(void *data)
@@ -648,21 +678,25 @@ static void coreaudio_destroy(void *data)
 	struct coreaudio_data *ca = data;
 
 	if (ca) {
-		if (ca->reconnecting) {
-			os_event_signal(ca->exit_event);
-			pthread_join(ca->reconnect_thread, NULL);
-		}
-
-		coreaudio_uninit(ca);
-
-		if (ca->unit)
-			AudioComponentInstanceDispose(ca->unit);
+		coreaudio_shutdown(ca);
 
 		os_event_destroy(ca->exit_event);
 		bfree(ca->device_name);
 		bfree(ca->device_uid);
 		bfree(ca);
 	}
+}
+
+static void coreaudio_update(void *data, obs_data_t *settings)
+{
+	struct coreaudio_data *ca = data;
+
+	coreaudio_shutdown(ca);
+
+	bfree(ca->device_uid);
+	ca->device_uid = bstrdup(obs_data_get_string(settings, "device_id"));
+
+	coreaudio_try_init(ca);
 }
 
 static void coreaudio_defaults(obs_data_t *settings)
@@ -753,6 +787,7 @@ struct obs_source_info coreaudio_input_capture_info = {
 	.get_name       = coreaudio_input_getname,
 	.create         = coreaudio_create_input_capture,
 	.destroy        = coreaudio_destroy,
+	.update         = coreaudio_update,
 	.get_defaults   = coreaudio_defaults,
 	.get_properties = coreaudio_input_properties
 };
@@ -764,6 +799,7 @@ struct obs_source_info coreaudio_output_capture_info = {
 	.get_name       = coreaudio_output_getname,
 	.create         = coreaudio_create_output_capture,
 	.destroy        = coreaudio_destroy,
+	.update         = coreaudio_update,
 	.get_defaults   = coreaudio_defaults,
 	.get_properties = coreaudio_output_properties
 };

@@ -71,6 +71,12 @@ struct encoder_packet {
 	 * priority or higher to continue transmission.
 	 */
 	int                   drop_priority;
+
+	/** Audio track index (used with outputs) */
+	size_t                track_idx;
+
+	/** Encoder from which the track originated from */
+	obs_encoder_t         *encoder;
 };
 
 /** Encoder input frame */
@@ -114,9 +120,10 @@ struct obs_encoder_info {
 	/**
 	 * Gets the full translated name of this encoder
 	 *
-	 * @return         Translated name of the encoder
+	 * @param  type_data  The type_data variable of this structure
+	 * @return            Translated name of the encoder
 	 */
-	const char *(*get_name)(void);
+	const char *(*get_name)(void *type_data);
 
 	/**
 	 * Creates the encoder with the specified settings
@@ -205,22 +212,21 @@ struct obs_encoder_info {
 	/**
 	 * Returns desired audio format and sample information
 	 *
-	 * @param       data  Data associated with this encoder context
-	 * @param[out]  info  Audio format information
-	 * @return            true if specific format is desired, false
-	 *                    otherwise
+	 * @param          data  Data associated with this encoder context
+	 * @param[in/out]  info  Audio format information
 	 */
-	bool (*get_audio_info)(void *data, struct audio_convert_info *info);
+	void (*get_audio_info)(void *data, struct audio_convert_info *info);
 
 	/**
 	 * Returns desired video format information
 	 *
-	 * @param       data  Data associated with this encoder context
-	 * @param[out]  info  Video format information
-	 * @return            true if specific format is desired, false
-	 *                    otherwise
+	 * @param          data  Data associated with this encoder context
+	 * @param[in/out]  info  Video format information
 	 */
-	bool (*get_video_info)(void *data, struct video_scale_info *info);
+	void (*get_video_info)(void *data, struct video_scale_info *info);
+
+	void *type_data;
+	void (*free_type_data)(void *type_data);
 };
 
 EXPORT void obs_register_encoder_s(const struct obs_encoder_info *info,

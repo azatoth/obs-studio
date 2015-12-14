@@ -1,6 +1,10 @@
 #define _CRT_SECURE_NO_WARNINGS
+
+#ifdef _MSC_VER
 #pragma warning(disable : 4214) /* nonstandard extension, non-int bitfield */
 #pragma warning(disable : 4054) /* function pointer to data pointer */
+#endif
+
 #include <windows.h>
 
 #define COBJMACROS
@@ -33,6 +37,7 @@ struct gl_data {
 	GLuint                         fbo;
 	bool                           using_shtex : 1;
 	bool                           using_scale : 1;
+	bool                           shmem_fallback : 1;
 
 	union {
 		/* shared texture */
@@ -248,7 +253,7 @@ static inline bool gl_shtex_init_window(void)
 
 typedef HRESULT (WINAPI *create_dxgi_factory1_t)(REFIID, void **);
 
-const static D3D_FEATURE_LEVEL feature_levels[] =
+static const D3D_FEATURE_LEVEL feature_levels[] =
 {
 	D3D_FEATURE_LEVEL_11_0,
 	D3D_FEATURE_LEVEL_10_1,
@@ -426,7 +431,7 @@ static bool gl_shtex_init(HWND window)
 	}
 	if (!capture_init_shtex(&data.shtex_info, window,
 				data.base_cx, data.base_cy, data.cx, data.cy,
-				data.format, true, (uint32_t)data.handle)) {
+				data.format, true, (uintptr_t)data.handle)) {
 		return false;
 	}
 
@@ -516,9 +521,14 @@ static bool gl_shmem_init(HWND window)
 	return true;
 }
 
-static void gl_init(HDC hdc)
+#define INIT_SUCCESS         0
+#define INIT_FAILED         -1
+#define INIT_SHTEX_FAILED   -2
+
+static int gl_init(HDC hdc)
 {
 	HWND window = WindowFromDC(hdc);
+	int ret = INIT_FAILED;
 	bool success = false;
 	RECT rc = {0};
 
@@ -530,7 +540,8 @@ static void gl_init(HDC hdc)
 	data.format = DXGI_FORMAT_B8G8R8A8_UNORM;
 	data.using_scale = global_hook_info->use_scale;
 	data.using_shtex = nv_capture_available &&
-		!global_hook_info->force_shmem;
+		!global_hook_info->force_shmem &&
+		!data.shmem_fallback;
 
 	if (data.using_scale) {
 		data.cx = global_hook_info->cx;
@@ -540,46 +551,53 @@ static void gl_init(HDC hdc)
 		data.cy = data.base_cy;
 	}
 
-	if (data.using_shtex)
+	if (data.using_shtex) {
 		success = gl_shtex_init(window);
-	else
+		if (!success)
+			ret = INIT_SHTEX_FAILED;
+	} else {
 		success = gl_shmem_init(window);
+	}
 
 	if (!success)
 		gl_free();
+	else
+		ret = INIT_SUCCESS;
+
+	return ret;
 }
 
 static void gl_copy_backbuffer(GLuint dst)
 {
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, data.fbo);
-	if (gl_error("gl_shtex_capture_blit", "failed to bind FBO")) {
+	if (gl_error("gl_copy_backbuffer", "failed to bind FBO")) {
 		return;
 	}
 
 	glBindTexture(GL_TEXTURE_2D, dst);
-	if (gl_error("gl_shtex_capture_blit", "failed to bind texture")) {
+	if (gl_error("gl_copy_backbuffer", "failed to bind texture")) {
 		return;
 	}
 
 	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 			GL_TEXTURE_2D, dst, 0);
-	if (gl_error("gl_shtex_capture_blit", "failed to set frame buffer")) {
+	if (gl_error("gl_copy_backbuffer", "failed to set frame buffer")) {
 		return;
 	}
 
 	glReadBuffer(GL_BACK);
-	if (gl_error("gl_shtex_capture_blit", "failed to set read buffer")) {
+	if (gl_error("gl_copy_backbuffer", "failed to set read buffer")) {
 		return;
 	}
 
 	glDrawBuffer(GL_COLOR_ATTACHMENT0);
-	if (gl_error("gl_shtex_capture_blit", "failed to set draw buffer")) {
+	if (gl_error("gl_copy_backbuffer", "failed to set draw buffer")) {
 		return;
 	}
 
 	glBlitFramebuffer(0, 0, data.base_cx, data.base_cy,
 			0, 0, data.cx, data.cy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-	gl_error("gl_shtex_capture_blit", "failed to blit");
+	gl_error("gl_copy_backbuffer", "failed to blit");
 }
 
 static void gl_shtex_capture(void)
@@ -697,7 +715,6 @@ static void gl_capture(HDC hdc)
 {
 	static bool functions_initialized = false;
 	static bool critical_failure = false;
-	static bool reacquireing = false;
 
 	if (critical_failure) {
 		return;
@@ -711,11 +728,17 @@ static void gl_capture(HDC hdc)
 		}
 	}
 
+	/* reset error flag */
+	glGetError();
+
 	if (capture_should_stop()) {
 		gl_free();
 	}
 	if (capture_should_init()) {
-		gl_init(hdc);
+		if (gl_init(hdc) == INIT_SHTEX_FAILED) {
+			data.shmem_fallback = true;
+			gl_init(hdc);
+		}
 	}
 	if (capture_ready() && hdc == data.hdc) {
 		uint32_t new_cx;
@@ -724,7 +747,8 @@ static void gl_capture(HDC hdc)
 		/* reset capture if resized */
 		get_window_size(hdc, &new_cx, &new_cy);
 		if (new_cx != data.base_cx || new_cy != data.base_cy) {
-			gl_free();
+			if (new_cx != 0 && new_cy != 0)
+				gl_free();
 			return;
 		}
 

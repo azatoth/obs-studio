@@ -89,9 +89,10 @@ static inline void handle_application_launch(syphon_t s, NSArray *new)
 }
 @end
 
-static const char *syphon_get_name()
+static const char *syphon_get_name(void *unused)
 {
-	return "Syphon";
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("Syphon");
 }
 
 static void stop_client(syphon_t s)
@@ -417,7 +418,7 @@ static inline bool init_obs_graphics_objects(syphon_t s)
 	s->vertbuffer = create_vertbuffer();
 	obs_leave_graphics();
 
-	s->effect     = obs_get_default_rect_effect();
+	s->effect = obs_get_base_effect(OBS_EFFECT_DEFAULT_RECT);
 
 	return s->sampler != NULL && s->vertbuffer != NULL && s->effect != NULL;
 }
@@ -739,8 +740,9 @@ static inline void app_to_data(NSRunningApplication *app, obs_data_t *app_data)
 	obs_data_set_string(app_data, "name", app.localizedName.UTF8String);
 	obs_data_set_string(app_data, "bundle",
 			app.bundleIdentifier.UTF8String);
+	// Until we drop 10.8, use path.fileSystemRepsentation
 	obs_data_set_string(app_data, "executable",
-			app.executableURL.fileSystemRepresentation);
+			app.executableURL.path.fileSystemRepresentation);
 	obs_data_set_int(app_data, "pid", app.processIdentifier);
 }
 

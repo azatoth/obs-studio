@@ -17,7 +17,9 @@
 
 #include "util/bmem.h"
 #include "util/threading.h"
+#include "util/dstr.h"
 #include "util/darray.h"
+#include "util/platform.h"
 #include "graphics/vec2.h"
 #include "graphics/vec3.h"
 #include "graphics/vec4.h"
@@ -129,7 +131,11 @@ static inline obs_data_t *get_item_obj(struct obs_data_item *item)
 	if (!item)
 		return NULL;
 
-	return *(obs_data_t**)get_item_data(item);
+	obs_data_t **data = get_item_data(item);
+	if (!data)
+		return NULL;
+
+	return *data;
 }
 
 static inline obs_data_t *get_item_default_obj(struct obs_data_item *item)
@@ -634,9 +640,55 @@ obs_data_t *obs_data_create_from_json(const char *json_string)
 		blog(LOG_ERROR, "obs-data.c: [obs_data_create_from_json] "
 		                "Failed reading json string (%d): %s",
 		                error.line, error.text);
+		obs_data_release(data);
+		data = NULL;
 	}
 
 	return data;
+}
+
+obs_data_t *obs_data_create_from_json_file(const char *json_file)
+{
+	char *file_data = os_quick_read_utf8_file(json_file);
+	obs_data_t *data = NULL;
+
+	if (file_data) {
+		data = obs_data_create_from_json(file_data);
+		bfree(file_data);
+	}
+
+	return data;
+}
+
+obs_data_t *obs_data_create_from_json_file_safe(const char *json_file,
+		const char *backup_ext)
+{
+	obs_data_t *file_data = obs_data_create_from_json_file(json_file);
+	if (!file_data && backup_ext && *backup_ext) {
+		struct dstr backup_file = {0};
+
+		dstr_copy(&backup_file, json_file);
+		if (*backup_ext != '.')
+			dstr_cat(&backup_file, ".");
+		dstr_cat(&backup_file, backup_ext);
+
+		if (os_file_exists(backup_file.array)) {
+			blog(LOG_WARNING, "obs-data.c: "
+					"[obs_data_create_from_json_file_safe] "
+					"attempting backup file");
+
+			/* delete current file if corrupt to prevent it from
+			 * being backed up again */
+			os_unlink(json_file);
+			os_rename(backup_file.array, json_file);
+
+			file_data = obs_data_create_from_json_file(json_file);
+		}
+
+		dstr_free(&backup_file);
+	}
+
+	return file_data;
 }
 
 void obs_data_addref(obs_data_t *data)
@@ -681,6 +733,31 @@ const char *obs_data_get_json(obs_data_t *data)
 	json_decref(root);
 
 	return data->json;
+}
+
+bool obs_data_save_json(obs_data_t *data, const char *file)
+{
+	const char *json = obs_data_get_json(data);
+
+	if (json && *json) {
+		return os_quick_write_utf8_file(file, json, strlen(json),
+				false);
+	}
+
+	return false;
+}
+
+bool obs_data_save_json_safe(obs_data_t *data, const char *file,
+		const char *temp_ext, const char *backup_ext)
+{
+	const char *json = obs_data_get_json(data);
+
+	if (json && *json) {
+		return os_quick_write_utf8_file_safe(file, json, strlen(json),
+				false, temp_ext, backup_ext);
+	}
+
+	return false;
 }
 
 static struct obs_data_item *get_item(struct obs_data *data, const char *name)
@@ -798,12 +875,63 @@ static inline void set_item_auto(struct obs_data *data, obs_data_item_t **item,
 	set_item_data(data, item, name, ptr, size, type, false, true);
 }
 
+static void copy_obj(struct obs_data *data, const char *name,
+		struct obs_data *obj,
+		void (*callback)(obs_data_t *, const char *, obs_data_t *))
+{
+	if (obj) {
+		obs_data_t *new_obj = obs_data_create();
+		obs_data_apply(new_obj, obj);
+		callback(data, name, new_obj);
+		obs_data_release(new_obj);
+	}
+}
+
+static void copy_array(struct obs_data *data, const char *name,
+		struct obs_data_array *array,
+		void (*callback)(obs_data_t*, const char*, obs_data_array_t*))
+{
+	if (array) {
+		obs_data_array_t *new_array = obs_data_array_create();
+		da_reserve(new_array->objects, array->objects.num);
+
+		for (size_t i = 0; i < array->objects.num; i++) {
+			obs_data_t *new_obj = obs_data_create();
+			obs_data_t *obj = array->objects.array[i];
+
+			obs_data_apply(new_obj, obj);
+			obs_data_array_push_back(new_array, new_obj);
+
+			obs_data_release(new_obj);
+		}
+
+		callback(data, name, new_array);
+		obs_data_array_release(new_array);
+	}
+}
+
 static inline void copy_item(struct obs_data *data, struct obs_data_item *item)
 {
 	const char *name = get_item_name(item);
 	void *ptr = get_item_data(item);
 
-	set_item(data, NULL, name, ptr, item->data_len, item->type);
+	if (item->type == OBS_DATA_OBJECT) {
+		obs_data_t **obj = item->data_size ? ptr : NULL;
+
+		if (obj)
+			copy_obj(data, name, *obj, obs_data_set_obj);
+
+	} else if (item->type == OBS_DATA_ARRAY) {
+		obs_data_array_t **array = item->data_size ? ptr : NULL;
+
+		if (array)
+			copy_array(data, name, *array, obs_data_set_array);
+
+	} else {
+		if (item->data_size)
+			set_item(data, NULL, name, ptr, item->data_size,
+					item->type);
+	}
 }
 
 void obs_data_apply(obs_data_t *target, obs_data_t *apply_data)
@@ -828,6 +956,49 @@ void obs_data_erase(obs_data_t *data, const char *name)
 	if (item) {
 		obs_data_item_detach(item);
 		obs_data_item_release(&item);
+	}
+}
+
+static inline void clear_item(struct obs_data_item *item)
+{
+	void *ptr = get_item_data(item);
+	size_t size;
+
+	if (item->data_len) {
+		if (item->type == OBS_DATA_OBJECT) {
+			obs_data_t **obj = item->data_size ? ptr : NULL;
+
+			if (obj && *obj)
+				obs_data_release(*obj);
+
+		} else if (item->type == OBS_DATA_ARRAY) {
+			obs_data_array_t **array = item->data_size ? ptr : NULL;
+
+			if (array && *array)
+				obs_data_array_release(*array);
+		}
+
+		size = item->default_len + item->autoselect_size;
+		if (size)
+			memmove(ptr, (uint8_t*)ptr + item->data_len, size);
+
+		item->data_size = 0;
+		item->data_len = 0;
+	}
+}
+
+void obs_data_clear(obs_data_t *target)
+{
+	struct obs_data_item *item;
+
+	if (!target)
+		return;
+
+	item = target->first_item;
+
+	while (item) {
+		clear_item(item);
+		item = item->next;
 	}
 }
 
@@ -883,6 +1054,14 @@ static inline void obs_set_array(obs_data_t *data, obs_data_item_t **item,
 		obs_data_array_t *array, set_item_t set_item_)
 {
 	set_item_(data, item, name, &array, sizeof(obs_data_t*), OBS_DATA_ARRAY);
+}
+
+static inline void obs_take_obj(obs_data_t *data, obs_data_item_t **item,
+		const char *name,
+		obs_data_t *obj, set_item_t set_item_)
+{
+	obs_set_obj(data, item, name, obj, set_item_);
+	obs_data_release(obj);
 }
 
 void obs_data_set_string(obs_data_t *data, const char *name, const char *val)
@@ -1812,4 +1991,162 @@ void obs_data_get_autoselect_quat(obs_data_t *data, const char *name,
 		struct quat *val)
 {
 	get_quat(obs_data_get_autoselect_obj(data, name), val);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Helper functions for media_frames_per_seconds */
+
+static inline obs_data_t *make_frames_per_second(
+		struct media_frames_per_second fps,
+		const char *option)
+{
+	obs_data_t *obj = obs_data_create();
+
+	if (!option) {
+		obs_data_set_double(obj, "numerator", fps.numerator);
+		obs_data_set_double(obj, "denominator", fps.denominator);
+
+	} else {
+		obs_data_set_string(obj, "option", option);
+	}
+
+	return obj;
+}
+
+void obs_data_set_frames_per_second(obs_data_t *data, const char *name,
+		struct media_frames_per_second fps, const char *option)
+{
+	obs_take_obj(data, NULL, name, make_frames_per_second(fps, option),
+			set_item);
+}
+
+void obs_data_set_default_frames_per_second(obs_data_t *data, const char *name,
+		struct media_frames_per_second fps, const char *option)
+{
+	obs_take_obj(data, NULL, name, make_frames_per_second(fps, option),
+			set_item_def);
+}
+
+void obs_data_set_autoselect_frames_per_second(obs_data_t *data,
+		const char *name, struct media_frames_per_second fps,
+		const char *option)
+{
+	obs_take_obj(data, NULL, name, make_frames_per_second(fps, option),
+			set_item_auto);
+}
+
+static inline bool get_option(obs_data_t *data, const char **option)
+{
+	if (!option) return false;
+
+	struct obs_data_item *opt = obs_data_item_byname(data, "option");
+	if (!opt) return false;
+
+	*option = obs_data_item_get_string(opt);
+	obs_data_item_release(&opt);
+
+	obs_data_release(data);
+
+	return true;
+}
+
+#define CLAMP(x, min, max) ((x) < min ? min : ((x) > max ? max : (x)))
+
+static inline bool get_frames_per_second(obs_data_t *data,
+		struct media_frames_per_second *fps,
+		const char **option)
+{
+	if (!data) return false;
+
+	if (get_option(data, option)) return true;
+
+	if (!fps) goto free;
+
+	struct obs_data_item *num = obs_data_item_byname(data, "numerator");
+	struct obs_data_item *den = obs_data_item_byname(data, "denominator");
+	if (!num || !den) {
+		obs_data_item_release(&num);
+		obs_data_item_release(&den);
+		goto free;
+	}
+
+	long long num_ll = obs_data_item_get_int(num);
+	long long den_ll = obs_data_item_get_int(den);
+
+	fps->numerator   = (uint32_t)CLAMP(num_ll, 0, (long long)UINT32_MAX);
+	fps->denominator = (uint32_t)CLAMP(den_ll, 0, (long long)UINT32_MAX);
+
+	obs_data_item_release(&num);
+	obs_data_item_release(&den);
+
+	obs_data_release(data);
+
+	return media_frames_per_second_is_valid(*fps);
+
+free:
+	obs_data_release(data);
+	return false;
+}
+
+bool obs_data_get_frames_per_second(obs_data_t *data, const char *name,
+		struct media_frames_per_second *fps, const char **option)
+{
+	return get_frames_per_second(obs_data_get_obj(data, name), fps, option);
+}
+
+bool obs_data_get_default_frames_per_second(obs_data_t *data, const char *name,
+		struct media_frames_per_second *fps, const char **option)
+{
+	return get_frames_per_second(obs_data_get_default_obj(data, name),
+			fps, option);
+}
+
+bool obs_data_get_autoselect_frames_per_second(obs_data_t *data,
+		const char *name, struct media_frames_per_second *fps,
+		const char **option)
+{
+	return get_frames_per_second(obs_data_get_autoselect_obj(data, name),
+			fps, option);
+}
+
+void obs_data_item_set_frames_per_second(obs_data_item_t **item,
+		struct media_frames_per_second fps, const char *option)
+{
+	obs_take_obj(NULL, item, NULL, make_frames_per_second(fps, option),
+			set_item);
+}
+
+void obs_data_item_set_default_frames_per_second(obs_data_item_t **item,
+		struct media_frames_per_second fps, const char *option)
+{
+	obs_take_obj(NULL, item, NULL, make_frames_per_second(fps, option),
+			set_item_def);
+}
+
+void obs_data_item_set_autoselect_frames_per_second(obs_data_item_t **item,
+		struct media_frames_per_second fps, const char *option)
+{
+	obs_take_obj(NULL, item, NULL, make_frames_per_second(fps, option),
+			set_item_auto);
+}
+
+bool obs_data_item_get_frames_per_second(obs_data_item_t *item,
+		struct media_frames_per_second *fps, const char **option)
+{
+	return get_frames_per_second(obs_data_item_get_obj(item),
+			fps, option);
+}
+
+bool obs_data_item_get_default_frames_per_second(obs_data_item_t *item,
+		struct media_frames_per_second *fps, const char **option)
+{
+	return get_frames_per_second(obs_data_item_get_default_obj(item),
+			fps, option);
+}
+
+bool obs_data_item_get_autoselect_frames_per_second(obs_data_item_t *item,
+		struct media_frames_per_second *fps, const char **option)
+{
+	return get_frames_per_second(obs_data_item_get_autoselect_obj(item),
+			fps, option);
 }

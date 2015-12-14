@@ -2,9 +2,15 @@ project(obs-outputs)
 
 if(WIN32)
 	set(obs-outputs_PLATFORM_DEPS
-		w32-pthreads
-		ws2_32.lib
-		winmm.lib)
+		ws2_32
+		winmm
+		Iphlpapi)
+endif()
+
+if(MSVC)
+	set(obs-outputs_PLATFORM_DEPS
+		${obs-outputs_PLATFORM_DEPS}
+		w32-pthreads)
 endif()
 
 set(obs-outputs_librtmp_HEADERS

@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <locale.h>
 #include "c99defs.h"
 #include "platform.h"
 #include "bmem.h"
@@ -235,6 +236,64 @@ bool os_quick_write_utf8_file(const char *path, const char *str, size_t len,
 	return true;
 }
 
+bool os_quick_write_utf8_file_safe(const char *path, const char *str,
+		size_t len, bool marker, const char *temp_ext,
+		const char *backup_ext)
+{
+	struct dstr backup_path = {0};
+	struct dstr temp_path = {0};
+	bool success = false;
+
+	if (!temp_ext || !*temp_ext) {
+		blog(LOG_ERROR, "os_quick_write_utf8_file_safe: invalid "
+		                "temporary extension specified");
+		return false;
+	}
+
+	dstr_copy(&temp_path, path);
+	if (*temp_ext != '.')
+		dstr_cat(&temp_path, ".");
+	dstr_cat(&temp_path, temp_ext);
+
+	if (!os_quick_write_utf8_file(temp_path.array, str, len, marker)) {
+		goto cleanup;
+	}
+
+	if (backup_ext && *backup_ext) {
+		dstr_copy(&backup_path, path);
+		if (*backup_ext != '.')
+			dstr_cat(&backup_path, ".");
+		dstr_cat(&backup_path, backup_ext);
+
+		os_unlink(backup_path.array);
+		os_rename(path, backup_path.array);
+
+		dstr_free(&backup_path);
+	} else {
+		os_unlink(path);
+	}
+
+	os_rename(temp_path.array, path);
+	success = true;
+
+cleanup:
+	dstr_free(&backup_path);
+	dstr_free(&temp_path);
+	return success;
+}
+
+int64_t os_get_file_size(const char *path)
+{
+	FILE* f = os_fopen(path, "rb");
+	if (!f)
+		return -1;
+
+	int64_t sz = os_fgetsize(f);
+	fclose(f);
+
+	return sz;
+}
+
 size_t os_mbs_to_wcs(const char *str, size_t len, wchar_t *dst, size_t dst_size)
 {
 	size_t out_len;
@@ -413,4 +472,133 @@ size_t os_mbs_to_utf8_ptr(const char *str, size_t len, char **pstr)
 
 	*pstr = dst;
 	return out_len;
+}
+
+/* locale independent double conversion from jansson, credit goes to them */
+
+static inline void to_locale(char *str)
+{
+	const char *point;
+	char *pos;
+
+	point = localeconv()->decimal_point;
+	if(*point == '.') {
+		/* No conversion needed */
+		return;
+	}
+
+	pos = strchr(str, '.');
+	if(pos)
+		*pos = *point;
+}
+
+static inline void from_locale(char *buffer)
+{
+	const char *point;
+	char *pos;
+
+	point = localeconv()->decimal_point;
+	if(*point == '.') {
+		/* No conversion needed */
+		return;
+	}
+
+	pos = strchr(buffer, *point);
+	if(pos)
+		*pos = '.';
+}
+
+double os_strtod(const char *str)
+{
+	char buf[64];
+	snprintf(buf, 64, "%s", str);
+	to_locale(buf);
+	return strtod(buf, NULL);
+}
+
+int os_dtostr(double value, char *dst, size_t size)
+{
+	int ret;
+	char *start, *end;
+	size_t length;
+
+	ret = snprintf(dst, size, "%.17g", value);
+	if(ret < 0)
+		return -1;
+
+	length = (size_t)ret;
+	if(length >= size)
+		return -1;
+
+	from_locale(dst);
+
+	/* Make sure there's a dot or 'e' in the output. Otherwise
+	   a real is converted to an integer when decoding */
+	if(strchr(dst, '.') == NULL && strchr(dst, 'e') == NULL) {
+		if(length + 3 >= size) {
+			/* No space to append ".0" */
+			return -1;
+		}
+		dst[length] = '.';
+		dst[length + 1] = '0';
+		dst[length + 2] = '\0';
+		length += 2;
+	}
+
+	/* Remove leading '+' from positive exponent. Also remove leading
+	   zeros from exponents (added by some printf() implementations) */
+	start = strchr(dst, 'e');
+	if(start) {
+		start++;
+		end = start + 1;
+
+		if(*start == '-')
+			start++;
+
+		while(*end == '0')
+			end++;
+
+		if(end != start) {
+			memmove(start, end, length - (size_t)(end - dst));
+			length -= (size_t)(end - start);
+		}
+	}
+
+	return (int)length;
+}
+
+static int recursive_mkdir(char *path)
+{
+	char *last_slash;
+	int ret;
+
+	ret = os_mkdir(path);
+	if (ret != MKDIR_ERROR)
+		return ret;
+
+	last_slash = strrchr(path, '/');
+	if (!last_slash)
+		return MKDIR_ERROR;
+
+	*last_slash = 0;
+	ret = recursive_mkdir(path);
+	*last_slash = '/';
+
+	if (ret == MKDIR_ERROR)
+		return MKDIR_ERROR;
+
+	ret = os_mkdir(path);
+	return ret;
+}
+
+int os_mkdirs(const char *dir)
+{
+	struct dstr dir_str;
+	int ret;
+
+	dstr_init_copy(&dir_str, dir);
+	dstr_replace(&dir_str, "\\", "/");
+	ret = recursive_mkdir(dir_str.array);
+	dstr_free(&dir_str);
+	return ret;
 }

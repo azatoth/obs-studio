@@ -56,8 +56,9 @@ struct obs_x264 {
 
 /* ------------------------------------------------------------------------- */
 
-static const char *obs_x264_getname(void)
+static const char *obs_x264_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return "x264";
 }
 
@@ -90,11 +91,13 @@ static void obs_x264_destroy(void *data)
 
 static void obs_x264_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_int   (settings, "bitrate",     1000);
-	obs_data_set_default_int   (settings, "buffer_size", 1000);
+	obs_data_set_default_int   (settings, "bitrate",     2500);
+	obs_data_set_default_bool  (settings, "use_bufsize", false);
+	obs_data_set_default_int   (settings, "buffer_size", 2500);
 	obs_data_set_default_int   (settings, "keyint_sec",  0);
 	obs_data_set_default_int   (settings, "crf",         23);
-	obs_data_set_default_bool  (settings, "cbr",         false);
+	obs_data_set_default_bool  (settings, "vfr",         false);
+	obs_data_set_default_bool  (settings, "cbr",         true);
 
 	obs_data_set_default_string(settings, "preset",      "veryfast");
 	obs_data_set_default_string(settings, "profile",     "");
@@ -111,12 +114,35 @@ static inline void add_strings(obs_property_t *list, const char *const *strings)
 }
 
 #define TEXT_BITRATE    obs_module_text("Bitrate")
+#define TEXT_CUSTOM_BUF obs_module_text("CustomBufsize")
 #define TEXT_BUF_SIZE   obs_module_text("BufferSize")
+#define TEXT_USE_CBR    obs_module_text("UseCBR")
+#define TEXT_VFR        obs_module_text("VFR")
+#define TEXT_CRF        obs_module_text("CRF")
 #define TEXT_KEYINT_SEC obs_module_text("KeyframeIntervalSec")
 #define TEXT_PRESET     obs_module_text("CPUPreset")
 #define TEXT_PROFILE    obs_module_text("Profile")
 #define TEXT_TUNE       obs_module_text("Tune")
+#define TEXT_NONE       obs_module_text("None")
 #define TEXT_X264_OPTS  obs_module_text("EncoderOptions")
+
+static bool use_bufsize_modified(obs_properties_t *ppts, obs_property_t *p,
+		obs_data_t *settings)
+{
+	bool use_bufsize = obs_data_get_bool(settings, "use_bufsize");
+	p = obs_properties_get(ppts, "buffer_size");
+	obs_property_set_visible(p, use_bufsize);
+	return true;
+}
+
+static bool use_cbr_modified(obs_properties_t *ppts, obs_property_t *p,
+		obs_data_t *settings)
+{
+	bool cbr = obs_data_get_bool(settings, "cbr");
+	p = obs_properties_get(ppts, "crf");
+	obs_property_set_visible(p, !cbr);
+	return true;
+}
 
 static obs_properties_t *obs_x264_props(void *unused)
 {
@@ -124,11 +150,20 @@ static obs_properties_t *obs_x264_props(void *unused)
 
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *list;
+	obs_property_t *p;
 
-	obs_properties_add_int(props, "bitrate", TEXT_BITRATE, 50, 100000, 1);
-	obs_properties_add_int(props, "buffer_size", TEXT_BUF_SIZE, 50, 100000,
-			1);
+	obs_properties_add_int(props, "bitrate", TEXT_BITRATE, 50, 10000000, 1);
+
+	p = obs_properties_add_bool(props, "use_bufsize", TEXT_CUSTOM_BUF);
+	obs_property_set_modified_callback(p, use_bufsize_modified);
+	obs_properties_add_int(props, "buffer_size", TEXT_BUF_SIZE, 0,
+			10000000, 1);
+
 	obs_properties_add_int(props, "keyint_sec", TEXT_KEYINT_SEC, 0, 20, 1);
+	p = obs_properties_add_bool(props, "cbr", TEXT_USE_CBR);
+	obs_properties_add_int(props, "crf", TEXT_CRF, 0, 51, 1);
+
+	obs_property_set_modified_callback(p, use_cbr_modified);
 
 	list = obs_properties_add_list(props, "preset", TEXT_PRESET,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
@@ -136,13 +171,17 @@ static obs_properties_t *obs_x264_props(void *unused)
 
 	list = obs_properties_add_list(props, "profile", TEXT_PROFILE,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(list, TEXT_NONE, "");
 	obs_property_list_add_string(list, "baseline", "baseline");
 	obs_property_list_add_string(list, "main", "main");
 	obs_property_list_add_string(list, "high", "high");
 
 	list = obs_properties_add_list(props, "tune", TEXT_TUNE,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(list, TEXT_NONE, "");
 	add_strings(list, x264_tune_names);
+
+	obs_properties_add_bool(props, "vfr", TEXT_VFR);
 
 	obs_properties_add_text(props, "x264opts", TEXT_X264_OPTS,
 			OBS_TEXT_DEFAULT);
@@ -312,11 +351,20 @@ static inline int get_x264_cs_val(enum video_colorspace cs,
 	return 0;
 }
 
+static void obs_x264_video_info(void *data, struct video_scale_info *info);
+
 static void update_params(struct obs_x264 *obsx264, obs_data_t *settings,
 		char **params)
 {
 	video_t *video = obs_encoder_video(obsx264->encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
+	struct video_scale_info info;
+
+	info.format = voi->format;
+	info.colorspace = voi->colorspace;
+	info.range = voi->range;
+
+	obs_x264_video_info(obsx264, &info);
 
 	int bitrate      = (int)obs_data_get_int(settings, "bitrate");
 	int buffer_size  = (int)obs_data_get_int(settings, "buffer_size");
@@ -324,13 +372,18 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings,
 	int crf          = (int)obs_data_get_int(settings, "crf");
 	int width        = (int)obs_encoder_get_width(obsx264->encoder);
 	int height       = (int)obs_encoder_get_height(obsx264->encoder);
+	bool use_bufsize = obs_data_get_bool(settings, "use_bufsize");
+	bool vfr         = obs_data_get_bool(settings, "vfr");
 	bool cbr         = obs_data_get_bool(settings, "cbr");
 
 	if (keyint_sec)
 		obsx264->params.i_keyint_max =
 			keyint_sec * voi->fps_num / voi->fps_den;
 
-	obsx264->params.b_vfr_input          = false;
+	if (!use_bufsize)
+		buffer_size = bitrate;
+
+	obsx264->params.b_vfr_input          = vfr;
 	obsx264->params.rc.i_vbv_max_bitrate = bitrate;
 	obsx264->params.rc.i_vbv_buffer_size = buffer_size;
 	obsx264->params.rc.i_bitrate         = bitrate;
@@ -343,13 +396,13 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings,
 	obsx264->params.i_log_level          = X264_LOG_WARNING;
 
 	obsx264->params.vui.i_transfer =
-		get_x264_cs_val(voi->colorspace, x264_transfer_names);
+		get_x264_cs_val(info.colorspace, x264_transfer_names);
 	obsx264->params.vui.i_colmatrix =
-		get_x264_cs_val(voi->colorspace, x264_colmatrix_names);
+		get_x264_cs_val(info.colorspace, x264_colmatrix_names);
 	obsx264->params.vui.i_colorprim =
-		get_x264_cs_val(voi->colorspace, x264_colorprim_names);
+		get_x264_cs_val(info.colorspace, x264_colorprim_names);
 	obsx264->params.vui.b_fullrange =
-		voi->range == VIDEO_RANGE_FULL;
+		info.range == VIDEO_RANGE_FULL;
 
 	/* use the new filler method for CBR to allow real-time adjusting of
 	 * the bitrate */
@@ -367,10 +420,12 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings,
 		obsx264->params.rc.f_rf_constant = (float)crf;
 	}
 
-	if (voi->format == VIDEO_FORMAT_NV12)
+	if (info.format == VIDEO_FORMAT_NV12)
 		obsx264->params.i_csp = X264_CSP_NV12;
-	else if (voi->format == VIDEO_FORMAT_I420)
+	else if (info.format == VIDEO_FORMAT_I420)
 		obsx264->params.i_csp = X264_CSP_I420;
+	else if (info.format == VIDEO_FORMAT_I444)
+		obsx264->params.i_csp = X264_CSP_I444;
 	else
 		obsx264->params.i_csp = X264_CSP_NV12;
 
@@ -380,17 +435,22 @@ static void update_params(struct obs_x264 *obsx264, obs_data_t *settings,
 	info("settings:\n"
 	     "\tbitrate:     %d\n"
 	     "\tbuffer size: %d\n"
+	     "\tcrf:         %d%s\n"
 	     "\tfps_num:     %d\n"
 	     "\tfps_den:     %d\n"
 	     "\twidth:       %d\n"
 	     "\theight:      %d\n"
 	     "\tkeyint:      %d\n"
+	     "\tvfr:         %s\n"
 	     "\tcbr:         %s",
 	     obsx264->params.rc.i_vbv_max_bitrate,
 	     obsx264->params.rc.i_vbv_buffer_size,
+	     (int)obsx264->params.rc.f_rf_constant,
+	     cbr ? " (0 when CBR is enabled)" : "",
 	     voi->fps_num, voi->fps_den,
 	     width, height,
 	     obsx264->params.i_keyint_max,
+	     vfr ? "on" : "off",
 	     cbr ? "on" : "off");
 }
 
@@ -405,6 +465,8 @@ static bool update_settings(struct obs_x264 *obsx264, obs_data_t *settings)
 	bool success = true;
 
 	paramlist = strlist_split(opts, ' ', false);
+
+	blog(LOG_INFO, "---------------------------------");
 
 	if (!obsx264->context) {
 		override_base_params(obsx264, paramlist,
@@ -541,6 +603,8 @@ static inline void init_pic_data(struct obs_x264 *obsx264, x264_picture_t *pic,
 		pic->img.i_plane = 2;
 	else if (obsx264->params.i_csp == X264_CSP_I420)
 		pic->img.i_plane = 3;
+	else if (obsx264->params.i_csp == X264_CSP_I444)
+		pic->img.i_plane = 3;
 
 	for (int i = 0; i < pic->img.i_plane; i++) {
 		pic->img.i_stride[i] = (int)frame->linesize[i];
@@ -600,23 +664,26 @@ static bool obs_x264_sei(void *data, uint8_t **sei, size_t *size)
 	return true;
 }
 
-static bool obs_x264_video_info(void *data, struct video_scale_info *info)
+static inline bool valid_format(enum video_format format)
+{
+	return format == VIDEO_FORMAT_I420 ||
+	       format == VIDEO_FORMAT_NV12 ||
+	       format == VIDEO_FORMAT_I444;
+}
+
+static void obs_x264_video_info(void *data, struct video_scale_info *info)
 {
 	struct obs_x264 *obsx264 = data;
-	video_t *video = obs_encoder_video(obsx264->encoder);
-	const struct video_output_info *vid_info = video_output_get_info(video);
+	enum video_format pref_format;
 
-	if (vid_info->format == VIDEO_FORMAT_I420 ||
-	    vid_info->format == VIDEO_FORMAT_NV12)
-		return false;
+	pref_format = obs_encoder_get_preferred_video_format(obsx264->encoder);
 
-	info->format     = VIDEO_FORMAT_NV12;
-	info->width      = vid_info->width;
-	info->height     = vid_info->height;
-	info->range      = vid_info->range;
-	info->colorspace = vid_info->colorspace;
+	if (!valid_format(pref_format)) {
+		pref_format = valid_format(info->format) ?
+			info->format : VIDEO_FORMAT_NV12;
+	}
 
-	return true;
+	info->format = pref_format;
 }
 
 struct obs_encoder_info obs_x264_encoder = {

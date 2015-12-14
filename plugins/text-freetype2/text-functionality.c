@@ -281,7 +281,7 @@ void cache_glyphs(struct ft2_source *srcdata, wchar_t *cache_glyphs)
 			for (uint32_t x = 0; x < g_w; x++) {
 				alpha = slot->bitmap.buffer[glyph_pos];
 				srcdata->texbuf[buf_pos] =
-					0x00FFFFFF ^ (alpha << 24);
+					0x00FFFFFF ^ ((uint32_t)alpha << 24);
 			}
 		}
 
@@ -346,7 +346,7 @@ void load_text_from_file(struct ft2_source *srcdata, const char *filename)
 	uint16_t header = 0;
 	size_t bytes_read;
 
-	tmp_file = fopen(filename, "rb");
+	tmp_file = os_fopen(filename, "rb");
 	if (tmp_file == NULL) {
 		if (!srcdata->file_load_failed) {
 			blog(LOG_WARNING, "Failed to open file %s", filename);

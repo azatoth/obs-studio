@@ -45,7 +45,7 @@ static inline bool get_monitor(gs_device_t *device, int monitor_idx,
 }
 
 gs_duplicator::gs_duplicator(gs_device_t *device_, int monitor_idx)
-	: device(device_), texture(nullptr)
+	: texture(nullptr), device(device_)
 {
 	ComPtr<IDXGIOutput1> output1;
 	ComPtr<IDXGIOutput> output;
@@ -129,12 +129,12 @@ EXPORT gs_duplicator_t *device_duplicator_create(gs_device_t *device,
 		duplicator = new gs_duplicator(device, monitor_idx);
 
 	} catch (const char *error) {
-		blog(LOG_ERROR, "device_duplicator_create: %s",
+		blog(LOG_DEBUG, "device_duplicator_create: %s",
 				error);
 		return nullptr;
 
 	} catch (HRError error) {
-		blog(LOG_ERROR, "device_duplicator_create: %s (%08lX)",
+		blog(LOG_DEBUG, "device_duplicator_create: %s (%08lX)",
 				error.str, error.hr);
 		return nullptr;
 	}

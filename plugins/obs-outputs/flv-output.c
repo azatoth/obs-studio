@@ -40,8 +40,9 @@ struct flv_output {
 	int64_t      last_packet_ts;
 };
 
-static const char *flv_output_getname(void)
+static const char *flv_output_getname(void *unused)
 {
+	UNUSED_PARAMETER(unused);
 	return obs_module_text("FLVOutput");
 }
 
@@ -107,7 +108,7 @@ static void write_meta_data(struct flv_output *stream)
 	uint8_t *meta_data;
 	size_t  meta_data_size;
 
-	flv_meta_data(stream->output, &meta_data, &meta_data_size, true);
+	flv_meta_data(stream->output, &meta_data, &meta_data_size, true, 0);
 	fwrite(meta_data, 1, meta_data_size, stream->file);
 	bfree(meta_data);
 }
@@ -115,7 +116,7 @@ static void write_meta_data(struct flv_output *stream)
 static void write_audio_header(struct flv_output *stream)
 {
 	obs_output_t  *context  = stream->output;
-	obs_encoder_t *aencoder = obs_output_get_audio_encoder(context);
+	obs_encoder_t *aencoder = obs_output_get_audio_encoder(context, 0);
 	uint8_t       *header;
 
 	struct encoder_packet packet   = {

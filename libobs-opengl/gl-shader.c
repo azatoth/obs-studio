@@ -395,7 +395,7 @@ void gs_shader_set_int(gs_sparam_t *param, int val)
 	da_copy_array(param->cur_value, &val, sizeof(val));
 }
 
-void gs_shader_setmatrix3(gs_sparam_t *param, const struct matrix3 *val)
+void gs_shader_set_matrix3(gs_sparam_t *param, const struct matrix3 *val)
 {
 	struct matrix4 mat;
 	matrix4_from_matrix3(&mat, val);
@@ -487,6 +487,7 @@ static void program_set_param_data(struct gs_program *program,
 		}
 
 	} else if (pp->param->type == GS_SHADER_PARAM_TEXTURE) {
+		glUniform1i(pp->obj, pp->param->texture_id);
 		device_load_texture(program->device, pp->param->texture,
 				pp->param->texture_id);
 	}
@@ -559,9 +560,7 @@ static bool assign_program_param(struct gs_program *program,
 		return false;
 
 	if (info.obj == -1) {
-		blog(LOG_ERROR, "Program parameter '%s' not found",
-				param->name);
-		return false;
+		return true;
 	}
 
 	info.param = param;

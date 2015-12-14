@@ -19,6 +19,7 @@
 
 #include "util/c99defs.h"
 #include "obs-data.h"
+#include "media-io/frame-rate.h"
 
 /**
  * @file
@@ -38,6 +39,9 @@
 extern "C" {
 #endif
 
+/** Only update when the user presses OK or Apply */
+#define OBS_PROPERTIES_DEFER_UPDATE            (1<<0)
+
 enum obs_property_type {
 	OBS_PROPERTY_INVALID,
 	OBS_PROPERTY_BOOL,
@@ -49,6 +53,8 @@ enum obs_property_type {
 	OBS_PROPERTY_COLOR,
 	OBS_PROPERTY_BUTTON,
 	OBS_PROPERTY_FONT,
+	OBS_PROPERTY_EDITABLE_LIST,
+	OBS_PROPERTY_FRAME_RATE,
 };
 
 enum obs_combo_format {
@@ -75,6 +81,11 @@ enum obs_text_type {
 	OBS_TEXT_MULTILINE,
 };
 
+enum obs_number_type {
+	OBS_NUMBER_SCROLLER,
+	OBS_NUMBER_SLIDER
+};
+
 #define OBS_FONT_BOLD      (1<<0)
 #define OBS_FONT_ITALIC    (1<<1)
 #define OBS_FONT_UNDERLINE (1<<2)
@@ -92,6 +103,9 @@ EXPORT obs_properties_t *obs_properties_create_param(void *param,
 		void (*destroy)(void *param));
 EXPORT void obs_properties_destroy(obs_properties_t *props);
 
+EXPORT void obs_properties_set_flags(obs_properties_t *props, uint32_t flags);
+EXPORT uint32_t obs_properties_get_flags(obs_properties_t *props);
+
 EXPORT void obs_properties_set_param(obs_properties_t *props,
 		void *param, void (*destroy)(void *param));
 EXPORT void *obs_properties_get_param(obs_properties_t *props);
@@ -101,8 +115,11 @@ EXPORT obs_property_t *obs_properties_first(obs_properties_t *props);
 EXPORT obs_property_t *obs_properties_get(obs_properties_t *props,
 		const char *property);
 
-/* used internally by libobs */
-extern void obs_properties_apply_settings(obs_properties_t *props,
+/**
+ * Applies settings to the properties by calling all the necessary
+ * modification callbacks
+ */
+EXPORT void obs_properties_apply_settings(obs_properties_t *props,
 		obs_data_t *settings);
 
 /* ------------------------------------------------------------------------- */
@@ -123,6 +140,14 @@ EXPORT obs_property_t *obs_properties_add_int(obs_properties_t *props,
 		int min, int max, int step);
 
 EXPORT obs_property_t *obs_properties_add_float(obs_properties_t *props,
+		const char *name, const char *description,
+		double min, double max, double step);
+
+EXPORT obs_property_t *obs_properties_add_int_slider(obs_properties_t *props,
+		const char *name, const char *description,
+		int min, int max, int step);
+
+EXPORT obs_property_t *obs_properties_add_float_slider(obs_properties_t *props,
 		const char *name, const char *description,
 		double min, double max, double step);
 
@@ -174,6 +199,14 @@ EXPORT obs_property_t *obs_properties_add_button(obs_properties_t *props,
 EXPORT obs_property_t *obs_properties_add_font(obs_properties_t *props,
 		const char *name, const char *description);
 
+EXPORT obs_property_t *obs_properties_add_editable_list(obs_properties_t *props,
+		const char *name, const char *description,
+		bool allow_files, const char *filter,
+		const char *default_path);
+
+EXPORT obs_property_t *obs_properties_add_frame_rate(obs_properties_t *props,
+		const char *name, const char *description);
+
 /* ------------------------------------------------------------------------- */
 
 /**
@@ -207,9 +240,11 @@ EXPORT bool                   obs_property_next(obs_property_t **p);
 EXPORT int                    obs_property_int_min(obs_property_t *p);
 EXPORT int                    obs_property_int_max(obs_property_t *p);
 EXPORT int                    obs_property_int_step(obs_property_t *p);
+EXPORT enum obs_number_type   obs_property_int_type(obs_property_t *p);
 EXPORT double                 obs_property_float_min(obs_property_t *p);
 EXPORT double                 obs_property_float_max(obs_property_t *p);
 EXPORT double                 obs_property_float_step(obs_property_t *p);
+EXPORT enum obs_number_type   obs_property_float_type(obs_property_t *p);
 EXPORT enum obs_text_type     obs_proprety_text_type(obs_property_t *p);
 EXPORT enum obs_path_type     obs_property_path_type(obs_property_t *p);
 EXPORT const char *           obs_property_path_filter(obs_property_t *p);
@@ -244,6 +279,39 @@ EXPORT const char *obs_property_list_item_name(obs_property_t *p, size_t idx);
 EXPORT const char *obs_property_list_item_string(obs_property_t *p, size_t idx);
 EXPORT long long   obs_property_list_item_int(obs_property_t *p, size_t idx);
 EXPORT double      obs_property_list_item_float(obs_property_t *p, size_t idx);
+
+EXPORT bool        obs_property_editable_list_allow_files(obs_property_t *p);
+EXPORT const char *obs_property_editable_list_filter(obs_property_t *p);
+EXPORT const char *obs_property_editable_list_default_path(obs_property_t *p);
+
+EXPORT void obs_property_frame_rate_clear(obs_property_t *p);
+EXPORT void obs_property_frame_rate_options_clear(obs_property_t *p);
+EXPORT void obs_property_frame_rate_fps_ranges_clear(obs_property_t *p);
+
+EXPORT size_t obs_property_frame_rate_option_add(obs_property_t *p,
+		const char *name, const char *description);
+EXPORT size_t obs_property_frame_rate_fps_range_add(obs_property_t *p,
+		struct media_frames_per_second min,
+		struct media_frames_per_second max);
+
+EXPORT void obs_property_frame_rate_option_insert(obs_property_t *p, size_t idx,
+		const char *name, const char *description);
+EXPORT void obs_property_frame_rate_fps_range_insert(obs_property_t *p,
+		size_t idx,
+		struct media_frames_per_second min,
+		struct media_frames_per_second max);
+
+EXPORT size_t      obs_property_frame_rate_options_count(obs_property_t *p);
+EXPORT const char *obs_property_frame_rate_option_name(obs_property_t *p,
+		size_t idx);
+EXPORT const char *obs_property_frame_rate_option_description(
+		obs_property_t *p, size_t idx);
+
+EXPORT size_t      obs_property_frame_rate_fps_ranges_count(obs_property_t *p);
+EXPORT struct media_frames_per_second obs_property_frame_rate_fps_range_min(
+		obs_property_t *p, size_t idx);
+EXPORT struct media_frames_per_second obs_property_frame_rate_fps_range_max(
+		obs_property_t *p, size_t idx);
 
 #ifdef __cplusplus
 }

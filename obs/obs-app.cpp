@@ -17,10 +17,15 @@
 
 #include <time.h>
 #include <stdio.h>
+#include <wchar.h>
+#include <chrono>
+#include <ratio>
 #include <sstream>
+#include <mutex>
 #include <util/bmem.h>
 #include <util/dstr.h>
 #include <util/platform.h>
+#include <util/profiler.hpp>
 #include <obs-config.h>
 #include <obs.hpp>
 
@@ -29,15 +34,17 @@
 #include "qt-wrappers.hpp"
 #include "obs-app.hpp"
 #include "window-basic-main.hpp"
+#include "window-basic-settings.hpp"
 #include "window-license-agreement.hpp"
 #include "crash-report.hpp"
 #include "platform.hpp"
 
 #include <fstream>
 
+#include <curl/curl.h>
+
 #ifdef _WIN32
 #include <windows.h>
-#define snprintf _snprintf
 #else
 #include <signal.h>
 #endif
@@ -49,13 +56,144 @@ static log_handler_t def_log_handler;
 static string currentLogFile;
 static string lastLogFile;
 
+static bool portable_mode = false;
+
+QObject *CreateShortcutFilter()
+{
+	return new OBSEventFilter([](QObject *obj, QEvent *event)
+	{
+		auto mouse_event = [](QMouseEvent &event)
+		{
+			obs_key_combination_t hotkey = {0, OBS_KEY_NONE};
+			bool pressed = event.type() == QEvent::MouseButtonPress;
+
+			switch (event.button()) {
+			case Qt::NoButton:
+			case Qt::LeftButton:
+			case Qt::RightButton:
+			case Qt::AllButtons:
+			case Qt::MouseButtonMask:
+				return false;
+
+			case Qt::MidButton:
+				hotkey.key = OBS_KEY_MOUSE3;
+				break;
+
+#define MAP_BUTTON(i, j) case Qt::ExtraButton ## i: \
+		hotkey.key = OBS_KEY_MOUSE ## j; break;
+			MAP_BUTTON( 1,  4);
+			MAP_BUTTON( 2,  5);
+			MAP_BUTTON( 3,  6);
+			MAP_BUTTON( 4,  7);
+			MAP_BUTTON( 5,  8);
+			MAP_BUTTON( 6,  9);
+			MAP_BUTTON( 7, 10);
+			MAP_BUTTON( 8, 11);
+			MAP_BUTTON( 9, 12);
+			MAP_BUTTON(10, 13);
+			MAP_BUTTON(11, 14);
+			MAP_BUTTON(12, 15);
+			MAP_BUTTON(13, 16);
+			MAP_BUTTON(14, 17);
+			MAP_BUTTON(15, 18);
+			MAP_BUTTON(16, 19);
+			MAP_BUTTON(17, 20);
+			MAP_BUTTON(18, 21);
+			MAP_BUTTON(19, 22);
+			MAP_BUTTON(20, 23);
+			MAP_BUTTON(21, 24);
+			MAP_BUTTON(22, 25);
+			MAP_BUTTON(23, 26);
+			MAP_BUTTON(24, 27);
+#undef MAP_BUTTON
+			}
+
+			hotkey.modifiers = TranslateQtKeyboardEventModifiers(
+							event.modifiers());
+
+			obs_hotkey_inject_event(hotkey, pressed);
+			return true;
+		};
+
+		auto key_event = [&](QKeyEvent *event)
+		{
+			QDialog *dialog = qobject_cast<QDialog*>(obj);
+
+			obs_key_combination_t hotkey = {0, OBS_KEY_NONE};
+			bool pressed = event->type() == QEvent::KeyPress;
+
+			switch (event->key()) {
+			case Qt::Key_Shift:
+			case Qt::Key_Control:
+			case Qt::Key_Alt:
+			case Qt::Key_Meta:
+				break;
+
+#ifdef __APPLE__
+			case Qt::Key_CapsLock:
+				// kVK_CapsLock == 57
+				hotkey.key = obs_key_from_virtual_key(57);
+				pressed = true;
+				break;
+#endif
+
+			case Qt::Key_Enter:
+			case Qt::Key_Escape:
+			case Qt::Key_Return:
+				if (dialog && pressed)
+					return false;
+			default:
+				hotkey.key = obs_key_from_virtual_key(
+					event->nativeVirtualKey());
+			}
+
+			hotkey.modifiers = TranslateQtKeyboardEventModifiers(
+							event->modifiers());
+
+			obs_hotkey_inject_event(hotkey, pressed);
+			return true;
+		};
+
+		switch (event->type()) {
+		case QEvent::MouseButtonPress:
+		case QEvent::MouseButtonRelease:
+			return mouse_event(*static_cast<QMouseEvent*>(event));
+
+		/*case QEvent::MouseButtonDblClick:
+		case QEvent::Wheel:*/
+		case QEvent::KeyPress:
+		case QEvent::KeyRelease:
+			return key_event(static_cast<QKeyEvent*>(event));
+
+		default:
+			return false;
+		}
+	});
+}
+
 string CurrentTimeString()
 {
-	time_t     now = time(0);
+	using namespace std::chrono;
+
 	struct tm  tstruct;
 	char       buf[80];
+
+	auto tp = system_clock::now();
+	auto now = system_clock::to_time_t(tp);
 	tstruct = *localtime(&now);
-	strftime(buf, sizeof(buf), "%X", &tstruct);
+
+	size_t written = strftime(buf, sizeof(buf), "%X", &tstruct);
+	if (ratio_less<system_clock::period, seconds::period>::value &&
+			written && (sizeof(buf) - written) > 5) {
+		auto tp_secs =
+			time_point_cast<seconds>(tp);
+		auto millis  =
+			duration_cast<milliseconds>(tp - tp_secs).count();
+
+		snprintf(buf + written, sizeof(buf) - written, ".%03u",
+				static_cast<unsigned>(millis));
+	}
+
 	return buf;
 }
 
@@ -67,6 +205,84 @@ string CurrentDateTimeString()
 	tstruct = *localtime(&now);
 	strftime(buf, sizeof(buf), "%Y-%m-%d, %X", &tstruct);
 	return buf;
+}
+
+static inline void LogString(fstream &logFile, const char *timeString,
+		char *str)
+{
+	logFile << timeString << str << endl;
+}
+
+static inline void LogStringChunk(fstream &logFile, char *str)
+{
+	char *nextLine = str;
+	string timeString = CurrentTimeString();
+	timeString += ": ";
+
+	while (*nextLine) {
+		char *nextLine = strchr(str, '\n');
+		if (!nextLine)
+			break;
+
+		if (nextLine != str && nextLine[-1] == '\r') {
+			nextLine[-1] = 0;
+		} else {
+			nextLine[0] = 0;
+		}
+
+		LogString(logFile, timeString.c_str(), str);
+		nextLine++;
+		str = nextLine;
+	}
+
+	LogString(logFile, timeString.c_str(), str);
+}
+
+#define MAX_REPEATED_LINES 30
+#define MAX_CHAR_VARIATION (255 * 3)
+
+static inline int sum_chars(const char *str)
+{
+	int val = 0;
+	for (; *str != 0; str++)
+		val += *str;
+
+	return val;
+}
+
+static inline bool too_many_repeated_entries(fstream &logFile, const char *msg,
+		const char *output_str)
+{
+	static mutex log_mutex;
+	static const char *last_msg_ptr = nullptr;
+	static int last_char_sum = 0;
+	static char cmp_str[4096];
+	static int rep_count = 0;
+
+	int new_sum = sum_chars(output_str);
+
+	lock_guard<mutex> guard(log_mutex);
+
+	if (last_msg_ptr == msg) {
+		int diff = std::abs(new_sum - last_char_sum);
+		if (diff < MAX_CHAR_VARIATION) {
+			return (rep_count++ >= MAX_REPEATED_LINES);
+		}
+	}
+
+	if (rep_count > MAX_REPEATED_LINES) {
+		logFile << CurrentTimeString() <<
+			": Last log entry repeated for " <<
+			to_string(rep_count - MAX_REPEATED_LINES) <<
+			" more lines" << endl;
+	}
+
+	last_msg_ptr = msg;
+	strcpy(cmp_str, output_str);
+	last_char_sum = new_sum;
+	rep_count = 0;
+
+	return false;
 }
 
 static void do_log(int log_level, const char *msg, va_list args, void *param)
@@ -88,8 +304,11 @@ static void do_log(int log_level, const char *msg, va_list args, void *param)
 	def_log_handler(log_level, msg, args2, nullptr);
 #endif
 
+	if (too_many_repeated_entries(logFile, msg, str))
+		return;
+
 	if (log_level <= LOG_INFO)
-		logFile << CurrentTimeString() << ": " << str << endl;
+		LogStringChunk(logFile, str);
 
 #ifdef _WIN32
 	if (log_level <= LOG_ERROR && IsDebuggerPresent())
@@ -112,12 +331,14 @@ bool OBSApp::InitGlobalConfigDefaults()
 	config_set_default_string(globalConfig, "Video", "Renderer", "OpenGL");
 #endif
 
+	config_set_default_bool(globalConfig, "BasicWindow", "PreviewEnabled",
+			true);
 	return true;
 }
 
 static bool do_mkdir(const char *path)
 {
-	if (os_mkdir(path) == MKDIR_ERROR) {
+	if (os_mkdirs(path) == MKDIR_ERROR) {
 		OBSErrorBox(NULL, "Failed to create directory %s", path);
 		return false;
 	}
@@ -127,17 +348,48 @@ static bool do_mkdir(const char *path)
 
 static bool MakeUserDirs()
 {
-	BPtr<char> path;
+	char path[512];
 
-	path = os_get_config_path("obs-studio");
+	if (GetConfigPath(path, sizeof(path), "obs-studio/basic") <= 0)
+		return false;
 	if (!do_mkdir(path))
 		return false;
 
-	path = os_get_config_path("obs-studio/basic");
+	if (GetConfigPath(path, sizeof(path), "obs-studio/logs") <= 0)
+		return false;
 	if (!do_mkdir(path))
 		return false;
 
-	path = os_get_config_path("obs-studio/logs");
+	if (GetConfigPath(path, sizeof(path), "obs-studio/profiler_data") <= 0)
+		return false;
+	if (!do_mkdir(path))
+		return false;
+
+#ifdef _WIN32
+	if (GetConfigPath(path, sizeof(path), "obs-studio/crashes") <= 0)
+		return false;
+	if (!do_mkdir(path))
+		return false;
+#endif
+	if (GetConfigPath(path, sizeof(path), "obs-studio/plugin_config") <= 0)
+		return false;
+	if (!do_mkdir(path))
+		return false;
+
+	return true;
+}
+
+static bool MakeUserProfileDirs()
+{
+	char path[512];
+
+	if (GetConfigPath(path, sizeof(path), "obs-studio/basic/profiles") <= 0)
+		return false;
+	if (!do_mkdir(path))
+		return false;
+
+	if (GetConfigPath(path, sizeof(path), "obs-studio/basic/scenes") <= 0)
+		return false;
 	if (!do_mkdir(path))
 		return false;
 
@@ -146,7 +398,13 @@ static bool MakeUserDirs()
 
 bool OBSApp::InitGlobalConfig()
 {
-	BPtr<char> path(os_get_config_path("obs-studio/global.ini"));
+	char path[512];
+
+	int len = GetConfigPath(path, sizeof(path),
+			"obs-studio/global.ini");
+	if (len <= 0) {
+		return false;
+	}
 
 	int errorcode = globalConfig.Open(path, CONFIG_OPEN_ALWAYS);
 	if (errorcode != CONFIG_SUCCESS) {
@@ -159,6 +417,7 @@ bool OBSApp::InitGlobalConfig()
 
 bool OBSApp::InitLocale()
 {
+	ProfileScope("OBSApp::InitLocale");
 	const char *lang = config_get_string(globalConfig, "General",
 			"Language");
 
@@ -224,20 +483,167 @@ bool OBSApp::InitLocale()
 	return true;
 }
 
-OBSApp::OBSApp(int &argc, char **argv)
-	: QApplication(argc, argv)
-{}
+bool OBSApp::SetTheme(std::string name, std::string path)
+{
+	theme = name;
+
+	/* Check user dir first, then preinstalled themes. */
+	if (path == "") {
+		char userDir[512];
+		name = "themes/" + name + ".qss";
+		string temp = "obs-studio/" + name;
+		int ret = GetConfigPath(userDir, sizeof(userDir),
+				temp.c_str());
+
+		if (ret > 0 && QFile::exists(userDir)) {
+			path = string(userDir);
+		} else if (!GetDataFilePath(name.c_str(), path)) {
+			OBSErrorBox(NULL, "Failed to find %s.", name.c_str());
+			return false;
+		}
+	}
+
+	QString mpath = QString("file:///") + path.c_str();
+	setStyleSheet(mpath);
+	return true;
+}
+
+bool OBSApp::InitTheme()
+{
+	const char *themeName = config_get_string(globalConfig, "General",
+			"Theme");
+
+	if (!themeName)
+		themeName = "Default";
+
+	stringstream t;
+	t << themeName;
+	return SetTheme(t.str());
+}
+
+OBSApp::OBSApp(int &argc, char **argv, profiler_name_store_t *store)
+	: QApplication(argc, argv),
+	  profilerNameStore(store)
+{
+	sleepInhibitor = os_inhibit_sleep_create("OBS Video/audio");
+}
+
+OBSApp::~OBSApp()
+{
+	os_inhibit_sleep_set_active(sleepInhibitor, false);
+	os_inhibit_sleep_destroy(sleepInhibitor);
+}
+
+static void move_basic_to_profiles(void)
+{
+	char path[512];
+	char new_path[512];
+	os_glob_t *glob;
+
+	/* if not first time use */
+	if (GetConfigPath(path, 512, "obs-studio/basic") <= 0)
+		return;
+	if (!os_file_exists(path))
+		return;
+
+	/* if the profiles directory doesn't already exist */
+	if (GetConfigPath(new_path, 512, "obs-studio/basic/profiles") <= 0)
+		return;
+	if (os_file_exists(new_path))
+		return;
+
+	if (os_mkdir(new_path) == MKDIR_ERROR)
+		return;
+
+	strcat(new_path, "/");
+	strcat(new_path, Str("Untitled"));
+	if (os_mkdir(new_path) == MKDIR_ERROR)
+		return;
+
+	strcat(path, "/*.*");
+	if (os_glob(path, 0, &glob) != 0)
+		return;
+
+	strcpy(path, new_path);
+
+	for (size_t i = 0; i < glob->gl_pathc; i++) {
+		struct os_globent ent = glob->gl_pathv[i];
+		char *file;
+
+		if (ent.directory)
+			continue;
+
+		file = strrchr(ent.path, '/');
+		if (!file++)
+			continue;
+
+		if (astrcmpi(file, "scenes.json") == 0)
+			continue;
+
+		strcpy(new_path, path);
+		strcat(new_path, "/");
+		strcat(new_path, file);
+		os_rename(ent.path, new_path);
+	}
+
+	os_globfree(glob);
+}
+
+static void move_basic_to_scene_collections(void)
+{
+	char path[512];
+	char new_path[512];
+
+	if (GetConfigPath(path, 512, "obs-studio/basic") <= 0)
+		return;
+	if (!os_file_exists(path))
+		return;
+
+	if (GetConfigPath(new_path, 512, "obs-studio/basic/scenes") <= 0)
+		return;
+	if (os_file_exists(new_path))
+		return;
+
+	if (os_mkdir(new_path) == MKDIR_ERROR)
+		return;
+
+	strcat(path, "/scenes.json");
+	strcat(new_path, "/");
+	strcat(new_path, Str("Untitled"));
+	strcat(new_path, ".json");
+
+	os_rename(path, new_path);
+}
 
 void OBSApp::AppInit()
 {
+	ProfileScope("OBSApp::AppInit");
+
 	if (!InitApplicationBundle())
 		throw "Failed to initialize application bundle";
 	if (!MakeUserDirs())
-		throw "Failed to created required user directories";
+		throw "Failed to create required user directories";
 	if (!InitGlobalConfig())
 		throw "Failed to initialize global config";
 	if (!InitLocale())
 		throw "Failed to load locale";
+	if (!InitTheme())
+		throw "Failed to load theme";
+
+	config_set_default_string(globalConfig, "Basic", "Profile",
+			Str("Untitled"));
+	config_set_default_string(globalConfig, "Basic", "ProfileDir",
+			Str("Untitled"));
+	config_set_default_string(globalConfig, "Basic", "SceneCollection",
+			Str("Untitled"));
+	config_set_default_string(globalConfig, "Basic", "SceneCollectionFile",
+			Str("Untitled"));
+
+	move_basic_to_profiles();
+	move_basic_to_scene_collections();
+
+	if (!MakeUserProfileDirs())
+		throw "Failed to create profile directories";
 }
 
 const char *OBSApp::GetRenderModule() const
@@ -249,8 +655,20 @@ const char *OBSApp::GetRenderModule() const
 		DL_D3D11 : DL_OPENGL;
 }
 
+static bool StartupOBS(const char *locale, profiler_name_store_t *store)
+{
+	char path[512];
+
+	if (GetConfigPath(path, sizeof(path), "obs-studio/plugin_config") <= 0)
+		return false;
+
+	return obs_startup(locale, path, store);
+}
+
 bool OBSApp::OBSInit()
 {
+	ProfileScope("OBSApp::OBSInit");
+
 	bool licenseAccepted = config_get_bool(globalConfig, "General",
 			"LicenseAccepted");
 	OBSLicenseAgreement agreement(nullptr);
@@ -262,6 +680,9 @@ bool OBSApp::OBSInit()
 			config_save(globalConfig);
 		}
 
+		if (!StartupOBS(locale.c_str(), GetProfilerNameStore()))
+			return false;
+
 		mainWindow = new OBSBasic();
 
 		mainWindow->setAttribute(Qt::WA_DeleteOnClose, true);
@@ -269,6 +690,14 @@ bool OBSApp::OBSInit()
 
 		mainWindow->OBSInit();
 
+		connect(this, &QGuiApplication::applicationStateChanged,
+				[](Qt::ApplicationState state)
+				{
+					obs_hotkey_enable_background_press(
+						state != Qt::ApplicationActive);
+				});
+		obs_hotkey_enable_background_press(
+				applicationState() != Qt::ApplicationActive);
 		return true;
 	} else {
 		return false;
@@ -296,6 +725,8 @@ string OBSApp::GetVersionString() const
 	ver << "windows)";
 #elif __APPLE__
 	ver << "mac)";
+#elif __FreeBSD__
+	ver << "freebsd)";
 #else /* assume linux for the time being */
 	ver << "linux)";
 #endif
@@ -347,19 +778,6 @@ QString OBSTranslator::translate(const char *context, const char *sourceText,
 	return QT_UTF8(out);
 }
 
-struct NoFocusFrameStyle : QProxyStyle
-{
-	void drawControl(ControlElement element, const QStyleOption *option,
-			QPainter *painter, const QWidget *widget=nullptr)
-		const override
-	{
-		if (element == CE_FocusFrame)
-			return;
-
-		QProxyStyle::drawControl(element, option, painter, widget);
-	}
-};
-
 static bool get_token(lexer *lex, string &str, base_token_type type)
 {
 	base_token token;
@@ -406,9 +824,9 @@ static uint64_t convert_log_name(const char *name)
 	return std::stoull(timestring.str());
 }
 
-static void delete_oldest_log(void)
+static void delete_oldest_file(const char *location)
 {
-	BPtr<char>       logDir(os_get_config_path("obs-studio/logs"));
+	BPtr<char>       logDir(GetConfigPathPtr(location));
 	string           oldestLog;
 	uint64_t         oldest_ts = (uint64_t)-1;
 	struct os_dirent *entry;
@@ -449,7 +867,7 @@ static void delete_oldest_log(void)
 
 static void get_last_log(void)
 {
-	BPtr<char>       logDir(os_get_config_path("obs-studio/logs"));
+	BPtr<char>       logDir(GetConfigPathPtr("obs-studio/logs"));
 	struct os_dirent *entry;
 	os_dir_t         *dir        = os_opendir(logDir);
 	uint64_t         highest_ts = 0;
@@ -471,17 +889,18 @@ static void get_last_log(void)
 	}
 }
 
-string GenerateTimeDateFilename(const char *extension)
+string GenerateTimeDateFilename(const char *extension, bool noSpace)
 {
 	time_t    now = time(0);
 	char      file[256] = {};
 	struct tm *cur_time;
 
 	cur_time = localtime(&now);
-	snprintf(file, sizeof(file), "%d-%02d-%02d %02d-%02d-%02d.%s",
+	snprintf(file, sizeof(file), "%d-%02d-%02d%c%02d-%02d-%02d.%s",
 			cur_time->tm_year+1900,
 			cur_time->tm_mon+1,
 			cur_time->tm_mday,
+			noSpace ? '_' : ' ',
 			cur_time->tm_hour,
 			cur_time->tm_min,
 			cur_time->tm_sec,
@@ -522,35 +941,132 @@ static void create_log_file(fstream &logFile)
 	currentLogFile = GenerateTimeDateFilename("txt");
 	dst << "obs-studio/logs/" << currentLogFile.c_str();
 
-	BPtr<char> path(os_get_config_path(dst.str().c_str()));
+	BPtr<char> path(GetConfigPathPtr(dst.str().c_str()));
 	logFile.open(path,
 			ios_base::in | ios_base::out | ios_base::trunc);
 
 	if (logFile.is_open()) {
-		delete_oldest_log();
+		delete_oldest_file("obs-studio/logs");
 		base_set_log_handler(do_log, &logFile);
 	} else {
 		blog(LOG_ERROR, "Failed to open log file");
 	}
 }
 
+static auto ProfilerNameStoreRelease = [](profiler_name_store_t *store)
+{
+	profiler_name_store_free(store);
+};
+
+using ProfilerNameStore =
+	std::unique_ptr<profiler_name_store_t,
+			decltype(ProfilerNameStoreRelease)>;
+
+ProfilerNameStore CreateNameStore()
+{
+	return ProfilerNameStore{profiler_name_store_create(),
+					ProfilerNameStoreRelease};
+}
+
+static auto SnapshotRelease = [](profiler_snapshot_t *snap)
+{
+	profile_snapshot_free(snap);
+};
+
+using ProfilerSnapshot = 
+	std::unique_ptr<profiler_snapshot_t, decltype(SnapshotRelease)>;
+
+ProfilerSnapshot GetSnapshot()
+{
+	return ProfilerSnapshot{profile_snapshot_create(), SnapshotRelease};
+}
+
+static void SaveProfilerData(const ProfilerSnapshot &snap)
+{
+	if (currentLogFile.empty())
+		return;
+
+	auto pos = currentLogFile.rfind('.');
+	if (pos == currentLogFile.npos)
+		return;
+
+#define LITERAL_SIZE(x) x, (sizeof(x) - 1)
+	ostringstream dst;
+	dst.write(LITERAL_SIZE("obs-studio/profiler_data/"));
+	dst.write(currentLogFile.c_str(), pos);
+	dst.write(LITERAL_SIZE(".csv.gz"));
+#undef LITERAL_SIZE
+
+	BPtr<char> path = GetConfigPathPtr(dst.str().c_str());
+	if (!profiler_snapshot_dump_csv_gz(snap.get(), path))
+		blog(LOG_WARNING, "Could not save profiler data to '%s'",
+				static_cast<const char*>(path));
+}
+
+static auto ProfilerFree = [](void *)
+{
+	profiler_stop();
+
+	auto snap = GetSnapshot();
+
+	profiler_print(snap.get());
+	profiler_print_time_between_calls(snap.get());
+
+	SaveProfilerData(snap);
+
+	profiler_free();
+};
+
+static const char *run_program_init = "run_program_init";
 static int run_program(fstream &logFile, int argc, char *argv[])
 {
 	int ret = -1;
+
+	auto profilerNameStore = CreateNameStore();
+
+	std::unique_ptr<void, decltype(ProfilerFree)>
+		prof_release(static_cast<void*>(&ProfilerFree),
+				ProfilerFree);
+
+	profiler_start();
+	profile_register_root(run_program_init, 0);
+
+	auto PrintInitProfile = [&]()
+	{
+		auto snap = GetSnapshot();
+
+		profiler_snapshot_filter_roots(snap.get(), [](void *data,
+					const char *name, bool *remove)
+		{
+			*remove = (*static_cast<const char**>(data)) != name;
+			return true;
+		}, static_cast<void*>(&run_program_init));
+
+		profiler_print(snap.get());
+	};
+
+	ScopeProfiler prof{run_program_init};
+
 	QCoreApplication::addLibraryPath(".");
 
-	OBSApp program(argc, argv);
+	OBSApp program(argc, argv, profilerNameStore.get());
 	try {
 		program.AppInit();
 
 		OBSTranslator translator;
 
 		create_log_file(logFile);
+		delete_oldest_file("obs-studio/profiler_data");
 
 		program.installTranslator(&translator);
-		program.setStyle(new NoFocusFrameStyle);
 
-		ret = program.OBSInit() ? program.exec() : 0;
+		if (!program.OBSInit())
+			return 0;
+
+		prof.Stop();
+		PrintInitProfile();
+
+		return program.exec();
 
 	} catch (const char *error) {
 		blog(LOG_ERROR, "%s", error);
@@ -562,24 +1078,55 @@ static int run_program(fstream &logFile, int argc, char *argv[])
 
 #define MAX_CRASH_REPORT_SIZE (50 * 1024)
 
+#ifdef _WIN32
+
+#define CRASH_MESSAGE \
+	"Woops, OBS has crashed!\n\nWould you like to copy the crash log " \
+	"to the clipboard?  (Crash logs will still be saved to the " \
+	"%appdata%\\obs-studio\\crashes directory)"
+
 static void main_crash_handler(const char *format, va_list args, void *param)
 {
-	char *test = new char[MAX_CRASH_REPORT_SIZE];
+	char *text = new char[MAX_CRASH_REPORT_SIZE];
 
-	vsnprintf(test, MAX_CRASH_REPORT_SIZE, format, args);
+	vsnprintf(text, MAX_CRASH_REPORT_SIZE, format, args);
 
-	OBSCrashReport crashReport(nullptr, test);
-	crashReport.exec();
+	delete_oldest_file("obs-studio/crashes");
+
+	string name = "obs-studio/crashes/Crash ";
+	name += GenerateTimeDateFilename("txt");
+
+	BPtr<char> path(GetConfigPathPtr(name.c_str()));
+
+	fstream file;
+	file.open(path, ios_base::in | ios_base::out | ios_base::trunc);
+	file << text;
+	file.close();
+
+	int ret = MessageBoxA(NULL, CRASH_MESSAGE, "OBS has crashed!",
+			MB_YESNO | MB_ICONERROR | MB_TASKMODAL);
+
+	if (ret == IDYES) {
+		size_t len = strlen(text);
+
+		HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, len);
+		memcpy(GlobalLock(mem), text, len);
+		GlobalUnlock(mem);
+
+		OpenClipboard(0);
+		EmptyClipboard();
+		SetClipboardData(CF_TEXT, mem);
+		CloseClipboard();
+	}
+
 	exit(-1);
 
 	UNUSED_PARAMETER(param);
 }
 
-#ifdef _WIN32
 static void load_debug_privilege(void)
 {
 	const DWORD flags = TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY;
-	bool success = false;
 	TOKEN_PRIVILEGES tp;
 	HANDLE token;
 	LUID val;
@@ -593,7 +1140,7 @@ static void load_debug_privilege(void)
 		tp.Privileges[0].Luid = val;
 		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-		success = !!AdjustTokenPrivileges(token, false, &tp,
+		AdjustTokenPrivileges(token, false, &tp,
 				sizeof(tp), NULL, NULL);
 	}
 
@@ -601,21 +1148,313 @@ static void load_debug_privilege(void)
 }
 #endif
 
+#ifdef __APPLE__
+#define BASE_PATH ".."
+#else
+#define BASE_PATH "../.."
+#endif
+
+#define CONFIG_PATH BASE_PATH "/config"
+
+#ifndef OBS_UNIX_STRUCTURE
+#define OBS_UNIX_STRUCTURE 0
+#endif
+
+int GetConfigPath(char *path, size_t size, const char *name)
+{
+	if (!OBS_UNIX_STRUCTURE && portable_mode) {
+		if (name && *name) {
+			return snprintf(path, size, CONFIG_PATH "/%s", name);
+		} else {
+			return snprintf(path, size, CONFIG_PATH);
+		}
+	} else {
+		return os_get_config_path(path, size, name);
+	}
+}
+
+char *GetConfigPathPtr(const char *name)
+{
+	if (!OBS_UNIX_STRUCTURE && portable_mode) {
+		char path[512];
+
+		if (snprintf(path, sizeof(path), CONFIG_PATH "/%s", name) > 0) {
+			return bstrdup(path);
+		} else {
+			return NULL;
+		}
+	} else {
+		return os_get_config_path_ptr(name);
+	}
+}
+
+bool GetFileSafeName(const char *name, std::string &file)
+{
+	size_t base_len = strlen(name);
+	size_t len = os_utf8_to_wcs(name, base_len, nullptr, 0);
+	std::wstring wfile;
+
+	if (!len)
+		return false;
+
+	wfile.resize(len);
+	os_utf8_to_wcs(name, base_len, &wfile[0], len);
+
+	for (size_t i = wfile.size(); i > 0; i--) {
+		size_t im1 = i - 1;
+
+		if (iswspace(wfile[im1])) {
+			wfile[im1] = '_';
+		} else if (wfile[im1] != '_' && !iswalnum(wfile[im1])) {
+			wfile.erase(im1, 1);
+		}
+	}
+
+	if (wfile.size() == 0)
+		wfile = L"characters_only";
+
+	len = os_wcs_to_utf8(wfile.c_str(), wfile.size(), nullptr, 0);
+	if (!len)
+		return false;
+
+	file.resize(len);
+	os_wcs_to_utf8(wfile.c_str(), wfile.size(), &file[0], len);
+	return true;
+}
+
+bool GetClosestUnusedFileName(std::string &path, const char *extension)
+{
+	size_t len = path.size();
+	if (extension) {
+		path += ".";
+		path += extension;
+	}
+
+	if (!os_file_exists(path.c_str()))
+		return true;
+
+	int index = 1;
+
+	do {
+		path.resize(len);
+		path += std::to_string(++index);
+		if (extension) {
+			path += ".";
+			path += extension;
+		}
+	} while (os_file_exists(path.c_str()));
+
+	return true;
+}
+
+static inline bool arg_is(const char *arg,
+		const char *long_form, const char *short_form)
+{
+	return (long_form  && strcmp(arg, long_form)  == 0) ||
+	       (short_form && strcmp(arg, short_form) == 0);
+}
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+#define IS_UNIX 1
+#endif
+
+/* if using XDG and was previously using an older build of OBS, move config
+ * files to XDG directory */
+#if defined(USE_XDG) && defined(IS_UNIX)
+static void move_to_xdg(void)
+{
+	char old_path[512];
+	char new_path[512];
+	char *home = getenv("HOME");
+	if (!home)
+		return;
+
+	if (snprintf(old_path, 512, "%s/.obs-studio", home) <= 0)
+		return;
+
+	/* make base xdg path if it doesn't already exist */
+	if (GetConfigPath(new_path, 512, "") <= 0)
+		return;
+	if (os_mkdirs(new_path) == MKDIR_ERROR)
+		return;
+
+	if (GetConfigPath(new_path, 512, "obs-studio") <= 0)
+		return;
+
+	if (os_file_exists(old_path) && !os_file_exists(new_path)) {
+		rename(old_path, new_path);
+	}
+}
+#endif
+
+static bool update_ffmpeg_output(ConfigFile &config)
+{
+	if (config_has_user_value(config, "AdvOut", "FFOutputToFile"))
+		return false;
+
+	const char *url = config_get_string(config, "AdvOut", "FFURL");
+	if (!url)
+		return false;
+
+	bool isActualURL = strstr(url, "://") != nullptr;
+	if (isActualURL)
+		return false;
+
+	string urlStr = url;
+	string extension;
+
+	for (size_t i = urlStr.length(); i > 0; i--) {
+		size_t idx = i - 1;
+
+		if (urlStr[idx] == '.') {
+			extension = &urlStr[i];
+		}
+
+		if (urlStr[idx] == '\\' || urlStr[idx] == '/') {
+			urlStr[idx] = 0;
+			break;
+		}
+	}
+
+	if (urlStr.empty() || extension.empty())
+		return false;
+
+	config_remove_value(config, "AdvOut", "FFURL");
+	config_set_string(config, "AdvOut", "FFFilePath", urlStr.c_str());
+	config_set_string(config, "AdvOut", "FFExtension", extension.c_str());
+	config_set_bool(config, "AdvOut", "FFOutputToFile", true);
+	return true;
+}
+
+static bool move_reconnect_settings(ConfigFile &config, const char *sec)
+{
+	bool changed = false;
+
+	if (config_has_user_value(config, sec, "Reconnect")) {
+		bool reconnect = config_get_bool(config, sec, "Reconnect");
+		config_set_bool(config, "Output", "Reconnect", reconnect);
+		changed = true;
+	}
+	if (config_has_user_value(config, sec, "RetryDelay")) {
+		int delay = (int)config_get_uint(config, sec, "RetryDelay");
+		config_set_uint(config, "Output", "RetryDelay", delay);
+		changed = true;
+	}
+	if (config_has_user_value(config, sec, "MaxRetries")) {
+		int retries = (int)config_get_uint(config, sec, "MaxRetries");
+		config_set_uint(config, "Output", "MaxRetries", retries);
+		changed = true;
+	}
+
+	return changed;
+}
+
+static bool update_reconnect(ConfigFile &config)
+{
+	if (!config_has_user_value(config, "Output", "Mode"))
+		return false;
+
+	const char *mode = config_get_string(config, "Output", "Mode");
+	if (!mode)
+		return false;
+
+	const char *section = (strcmp(mode, "Advanced") == 0) ?
+		"AdvOut" : "SimpleOutput";
+
+	if (move_reconnect_settings(config, section)) {
+		config_remove_value(config, "SimpleOutput", "Reconnect");
+		config_remove_value(config, "SimpleOutput", "RetryDelay");
+		config_remove_value(config, "SimpleOutput", "MaxRetries");
+		config_remove_value(config, "AdvOut", "Reconnect");
+		config_remove_value(config, "AdvOut", "RetryDelay");
+		config_remove_value(config, "AdvOut", "MaxRetries");
+		return true;
+	}
+
+	return false;
+}
+
+static void upgrade_settings(void)
+{
+	char path[512];
+	int pathlen = GetConfigPath(path, 512, "obs-studio/basic/profiles");
+
+	if (pathlen <= 0)
+		return;
+	if (!os_file_exists(path))
+		return;
+
+	os_dir_t *dir = os_opendir(path);
+	if (!dir)
+		return;
+
+	struct os_dirent *ent = os_readdir(dir);
+
+	while (ent) {
+		if (ent->directory) {
+			strcat(path, "/");
+			strcat(path, ent->d_name);
+			strcat(path, "/basic.ini");
+
+			ConfigFile config;
+			int ret;
+
+			ret = config.Open(path, CONFIG_OPEN_EXISTING);
+			if (ret == CONFIG_SUCCESS) {
+				if (update_ffmpeg_output(config) ||
+				    update_reconnect(config)) {
+					config_save_safe(config, "tmp",
+							nullptr);
+				}
+			}
+
+			path[pathlen] = 0;
+		}
+
+		ent = os_readdir(dir);
+	}
+
+	os_closedir(dir);
+}
+
 int main(int argc, char *argv[])
 {
-#ifndef WIN32
+#ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
 #ifdef _WIN32
 	load_debug_privilege();
+	base_set_crash_handler(main_crash_handler, nullptr);
 #endif
 
-	base_set_crash_handler(main_crash_handler, nullptr);
 	base_get_log_handler(&def_log_handler, nullptr);
+
+#if defined(USE_XDG) && defined(IS_UNIX)
+	move_to_xdg();
+#endif
+
+	for (int i = 1; i < argc; i++) {
+		if (arg_is(argv[i], "--portable", "-p")) {
+			portable_mode = true;
+		}
+	}
+
+#if !OBS_UNIX_STRUCTURE
+	if (!portable_mode) {
+		portable_mode =
+			os_file_exists(BASE_PATH "/portable_mode") ||
+			os_file_exists(BASE_PATH "/obs_portable_mode") ||
+			os_file_exists(BASE_PATH "/portable_mode.txt") ||
+			os_file_exists(BASE_PATH "/obs_portable_mode.txt");
+	}
+#endif
+
+	upgrade_settings();
 
 	fstream logFile;
 
+	curl_global_init(CURL_GLOBAL_ALL);
 	int ret = run_program(logFile, argc, argv);
 
 	blog(LOG_INFO, "Number of memory leaks: %ld", bnum_allocs());
